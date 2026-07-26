@@ -484,23 +484,29 @@ pub(crate) fn predicted_true_peak_dbtp(ref_tp_dbtp: f64, ref_level: f32, final_l
 }
 
 /// Shared MEASURE seam behind `capture_full` and `doctor_capture`: load `slot` in
-/// its own connection, settle, drop; fresh-connect → (when `scene` is `Some`)
-/// re-activate that 0-based `scenes[]` wire index ON THE CAPTURE CONNECTION → set
-/// the reference level → engage re-amp once → `audio::reamp_capture(.., tail_ms)`
-/// → guaranteed re-amp off.
+/// its own connection, settle, drop; fresh-connect → recall the scene ON THE
+/// CAPTURE CONNECTION → set the reference level → engage re-amp once →
+/// `audio::reamp_capture(.., tail_ms)` → guaranteed re-amp off.
 ///
 /// The scene MUST be loaded on the capture connection, not the load connection:
 /// the preset survives the load→capture reconnect but **the active scene does
 /// not** (see `set_knob`'s "scene + scene-edit don't survive the leveller's
 /// reconnects" — HW). Loading it only in the dropped load connection measured
 /// whatever scene the unit was already on, so every scene read the same signal.
-/// `scene` is `None` and `tail_ms` is `CAPTURE_TAIL_MS` for every existing
-/// `capture_full` call, so that path is byte-identical to before this extraction.
-/// `skip_load`: omit the load connection entirely — ONLY when the caller knows the
-/// preset is already current AND unpolluted (same preset, previous capture made no
-/// working-copy writes; the Doctor's consecutive-scene chain). The preset working
-/// copy survives reconnects (HW-proven); the scene recall below re-materializes the
-/// scene state on the capture connection either way.
+///
+/// `scene`/`skip_load` interact: when this call just freshly loaded the preset
+/// (`!skip_load`), nothing unsaved is at risk, so `scene: None` means "recall
+/// BASE explicitly" — omitting the recall used to silently measure whatever
+/// scene the connection defaulted to (the preset's saved `lastLoadedScene`), not
+/// base. When `skip_load` is set, the caller is asserting the device ALREADY
+/// holds exactly the state to measure (Doctor's consecutive-scene chain, or a
+/// caller preserving unsaved edits made on an earlier connection — see
+/// `doctor_capture_current`'s doc), so `scene: None` there means "don't touch
+/// scene state at all" — a recall would risk REVERTING those unsaved edits
+/// before this capture ever ran (the same hazard `capture_on_session` exists to
+/// avoid for `doctor_apply`'s step (c)). `tail_ms` is `CAPTURE_TAIL_MS` for
+/// every existing `capture_full` call, so that path is otherwise unchanged by
+/// this extraction.
 fn capture_full_at(
     slot: u32,
     scene: Option<u32>,
@@ -518,14 +524,39 @@ fn capture_full_at(
         std::thread::sleep(Duration::from_millis(RECONNECT_GAP_MS));
     }
     let mut s = Session::connect_lean()?;
+    let recall = if skip_load {
+        scene
+    } else {
+        Some(scene.unwrap_or(crate::session::BASE_SCENE_SLOT))
+    };
     // Re-assert the scene on THIS (capture) connection before setting the level —
     // load_scene recalls the scene's own state, so it must precede the reference-
     // level write, not follow it.
-    if let Some(scene) = scene {
+    if let Some(scene) = recall {
         s.load_scene(scene)?;
         std::thread::sleep(Duration::from_millis(SETTLE_AFTER_SET_MS));
     }
-    // Force-bypass isolation AFTER the scene recall, BEFORE the presetLevel set +
+    capture_on_session(&mut s, force_bypass, stimulus, ref_level, tail_ms)
+}
+
+/// Force-bypass isolation → optional reference level → engage → `reamp_capture` →
+/// guaranteed re-amp off, on an ALREADY-OPEN session. Does NOT load a preset or
+/// recall a scene — the caller does that first, if at all, since re-`load_scene`ing
+/// between writes reverts the prior write's unsaved value (`set_knobs`'s doc); this
+/// seam exists precisely so a caller that has ALREADY applied unsaved edits on `s`
+/// (Doctor's `ops_session`) can capture them without a further recall silently
+/// discarding them. Shared tail of `capture_full_at` (which recalls the scene,
+/// then calls this) and `doctor_capture_on_session` (used by
+/// `commands::doctor::doctor_apply`'s step (c), on the session step (b) just
+/// wrote to).
+pub(crate) fn capture_on_session(
+    s: &mut Session,
+    force_bypass: &[(String, String, bool)],
+    stimulus: &[f32],
+    ref_level: Option<f32>,
+    tail_ms: u64,
+) -> Result<audio::Capture, String> {
+    // Force-bypass isolation AFTER any scene recall, BEFORE the presetLevel set +
     // engage (the `measure_knob_at` ordering): a scene load would re-assert the
     // scene's own bypass state, so isolation must land after it.
     for (g, n, byp) in force_bypass {
@@ -534,7 +565,7 @@ fn capture_full_at(
     // `None` = capture at the preset's OWN stored level (Doctor's apply A/B),
     // leaving the edit buffer's presetLevel untouched.
     if let Some(ref_level) = ref_level {
-        set_knob(&mut s, &LevelKnob::PresetLevel, ref_level.clamp(0.05, 1.0))?;
+        set_knob(s, &LevelKnob::PresetLevel, ref_level.clamp(0.05, 1.0))?;
         std::thread::sleep(Duration::from_millis(SETTLE_AFTER_SET_MS));
     }
     let _ = s.set_reamp_mode(true)?;
@@ -558,6 +589,33 @@ pub fn capture_full(slot: u32, stimulus: &[f32], ref_level: f32) -> Result<audio
         CAPTURE_TAIL_MS,
         false,
     )
+}
+
+/// HW-probe MEASURE seam: the captured loudness of `slot` (or of the CURRENT
+/// preset when `slot` is `None`) at its OWN stored level, optionally after
+/// recalling the 0-based `scenes[]` wire index `scene`.
+///
+/// Delegates to `capture_full_at` so a diagnostic arm exercises the EXACT
+/// production choreography (lean handshakes + the HW-validated settles) rather
+/// than a parallel copy of it. `probe --measure-scene` used to hand-roll its own
+/// — two back-to-back FULL `Session::connect()` handshakes with an early engage —
+/// which drops `set_reamp_mode(true)` and yields silent captures that read as
+/// device flakiness (the "no signal captured" class in `notes/leveling.md`).
+pub fn capture_loudness_asis(
+    slot: Option<u32>,
+    scene: Option<u32>,
+    stimulus: &[f32],
+) -> Result<lufs::Loudness, String> {
+    let cap = capture_full_at(
+        slot.unwrap_or(0), // unused when skip_load
+        scene,
+        &[],
+        stimulus,
+        None,
+        CAPTURE_TAIL_MS,
+        slot.is_none(),
+    );
+    loudest_loudness(cap)
 }
 
 /// MEASURE seam for analysis (spectrum / audit): load `slot`, re-amp the
@@ -598,7 +656,7 @@ pub fn doctor_capture(
     tail_ms: u64,
     skip_load: bool,
 ) -> Result<(Vec<f32>, u32), String> {
-    let cap = capture_full_at(
+    Ok(to_stereo(capture_full_at(
         slot,
         scene,
         force_bypass,
@@ -606,9 +664,16 @@ pub fn doctor_capture(
         ref_level,
         tail_ms,
         skip_load,
-    )?;
+    )?))
+}
+
+/// Deterministic stereo mixdown (`Capture::stereo_mix` — average of USB-Out 1/2,
+/// not the leveling path's argmax `loudest_channel`, which can flip L/R across
+/// runs on a stereo preset and flip spectral verdicts with it) — the shared tail
+/// of every Doctor capture seam.
+fn to_stereo(cap: audio::Capture) -> (Vec<f32>, u32) {
     let sr = cap.sample_rate;
-    Ok((cap.stereo_mix(), sr))
+    (cap.stereo_mix(), sr)
 }
 
 /// Doctor A/B AFTER-clip seam: capture the CURRENT live edit-buffer state WITHOUT
@@ -638,7 +703,7 @@ pub fn doctor_capture_current(
     tail_ms: u64,
 ) -> Result<(Vec<f32>, u32), String> {
     std::thread::sleep(Duration::from_millis(RECONNECT_GAP_MS));
-    let cap = capture_full_at(
+    Ok(to_stereo(capture_full_at(
         0, // slot unused: skip_load
         scene,
         force_bypass,
@@ -646,9 +711,29 @@ pub fn doctor_capture_current(
         ref_level,
         tail_ms,
         true,
-    )?;
-    let sr = cap.sample_rate;
-    Ok((cap.stereo_mix(), sr))
+    )?))
+}
+
+/// Doctor A/B AFTER-clip seam on an ALREADY-OPEN session — no load, no scene
+/// recall. Used ONLY by `doctor_apply`'s step (c), which must capture on the
+/// SAME session `ops_session` just applied the prescription ops to: a fresh
+/// reconnect (what `doctor_capture_current` does) would recall the scene again,
+/// reverting those unsaved ops before this capture ever ran and silently
+/// rendering an identical AFTER clip. Stereo mixdown: see `to_stereo`.
+pub fn doctor_capture_on_session(
+    s: &mut Session,
+    force_bypass: &[(String, String, bool)],
+    stimulus: &[f32],
+    ref_level: Option<f32>,
+    tail_ms: u64,
+) -> Result<(Vec<f32>, u32), String> {
+    Ok(to_stereo(capture_on_session(
+        s,
+        force_bypass,
+        stimulus,
+        ref_level,
+        tail_ms,
+    )?))
 }
 
 /// MEASURE seam for scene leveling: load `slot`, then for each scene in
@@ -921,9 +1006,15 @@ pub struct PrevKnobWrite {
 /// Restore a redistribution: write `preset_level` + every recorded amp `outputLevel` back on
 /// ONE live-edit session (base scene recalled before the save — the empty-graph-corruption
 /// guard), name-guarded. The reverse of `redistribute_clamped_headroom`'s persisted write —
-/// pure writes, NO measurement. `set_knob` does the scene-edit for an overlay knob and a plain
-/// write for the base. Slot-keyed destructive write ⇒ a non-destructive name read guards it
-/// first, so a drifted list fails loudly instead of restoring onto a different preset.
+/// pure writes, NO measurement. Slot-keyed destructive write ⇒ a non-destructive name read
+/// guards it first, so a drifted list fails loudly instead of restoring onto a different preset.
+///
+/// `knobs` is written GROUPED by `scene_slot` (one `set_knobs` call per distinct scene,
+/// base included), not one `set_knob` call per knob: a parallel-merged preset's base or a
+/// single scene can carry ≥2 restored knobs, and calling `set_knob` per knob would
+/// re-`load_scene` the SAME target between them, reverting the earlier knob's just-written
+/// value before this function ever saves (`set_knobs`'s own doc: "calling `set_knob` per
+/// knob re-`load_scene`s between writes, which reverts the prior knob's unsaved value").
 pub fn restore_redistribution(
     slot: u32,
     preset_level: f32,
@@ -945,19 +1036,45 @@ pub fn restore_redistribution(
     }
     s.set_preset_level(preset_level)?;
     std::thread::sleep(Duration::from_millis(SETTLE_AFTER_SET_MS));
-    for k in knobs {
-        let knob = LevelKnob::Block {
+    write_grouped_knobs(&mut s, knobs)?;
+    recall_base(&mut s)?;
+    s.save_current_preset(slot)
+}
+
+/// Write `knobs` GROUPED by `scene_slot` (one `set_knobs` call per distinct scene,
+/// base included) on an already-open session — split out of `restore_redistribution`
+/// so the grouping is unit-testable against `SimDevice` without a real HID
+/// connection (`restore_redistribution` itself needs `Session::connect()` +
+/// `list_my_presets`' "My Presets" echo, which the fake doesn't model). See
+/// `restore_redistribution`'s doc for why grouping (not one `set_knob` call per
+/// knob) matters.
+fn write_grouped_knobs(s: &mut Session, knobs: &[PrevKnobWrite]) -> Result<(), String> {
+    let level_knobs: Vec<LevelKnob> = knobs
+        .iter()
+        .map(|k| LevelKnob::Block {
             group_id: k.group_id.clone(),
             node_id: k.node_id.clone(),
             parameter_id: "outputLevel".to_string(),
             scene_slot: k.scene_slot,
-        };
-        set_knob(&mut s, &knob, k.value)?;
+        })
+        .collect();
+    let mut scenes_seen: Vec<Option<u32>> = Vec::new();
+    for k in knobs {
+        if !scenes_seen.contains(&k.scene_slot) {
+            scenes_seen.push(k.scene_slot);
+        }
+    }
+    for scene in scenes_seen {
+        let group: Vec<(&LevelKnob, f32)> = level_knobs
+            .iter()
+            .zip(knobs)
+            .filter(|(_, k)| k.scene_slot == scene)
+            .map(|(lk, k)| (lk, k.value))
+            .collect();
+        set_knobs(s, &group)?;
         let _ = s.heartbeat();
     }
-    s.load_scene(crate::session::BASE_SCENE_SLOT)?;
-    std::thread::sleep(Duration::from_millis(SETTLE_AFTER_SET_MS));
-    s.save_current_preset(slot)
+    Ok(())
 }
 
 /// Is the solved `final_level` the same as the preset's already-saved `previous`
@@ -1232,8 +1349,11 @@ pub enum LevelKnob {
         /// When `Some(scene_slot)` (0-based `scenes[]` wire index), each connection
         /// loads that scene and enables per-block Scene Edit before driving the knob,
         /// so the write lands on the SCENE overlay (per-scene leveling). `None` =
-        /// level the base/preset value (a normal block knob; base needs no recall —
-        /// the preset load activates it).
+        /// level the base value — `set_knob`/`set_knobs` still recall base
+        /// explicitly (via `BASE_SCENE_SLOT`) before writing: a preset load
+        /// activates its SAVED `lastLoadedScene`, not necessarily base (HW), so
+        /// omitting the recall would silently write whatever scene the connection
+        /// defaulted to.
         scene_slot: Option<u32>,
     },
 }
@@ -1301,37 +1421,26 @@ pub struct SceneLevelBenchmarkRow {
     pub failure: Option<String>,
 }
 
-/// Set the chosen knob to `value` on an open session (before re-amp engage).
+/// Recall base explicitly (`BASE_SCENE_SLOT`) + the standard post-recall settle —
+/// shared by every base-context write/save seam that isn't already inside a
+/// per-scene Scene Edit dance (which pays its own `SETTLE_AFTER_SCENE_RECALL_MS`
+/// / `SETTLE_AFTER_SCENE_EDIT_MS` pair instead, in `set_knobs`).
+fn recall_base(s: &mut Session) -> Result<(), String> {
+    s.load_scene(crate::session::BASE_SCENE_SLOT)?;
+    std::thread::sleep(Duration::from_millis(SETTLE_AFTER_SET_MS));
+    Ok(())
+}
+
+/// Set the chosen knob to `value` on an open session (before re-amp engage). The
+/// single-knob case of `set_knobs` — see its doc for the recall/write ordering
+/// rules. Must be the FIRST write on the connection when `knob` is a `Block`
+/// (its own scene recall, base or otherwise, reverts any earlier unsaved write
+/// on this session — see `capture_on_session`'s doc); callers writing
+/// force-bypass isolation first (`measure_knob_at`) must only pair it with a
+/// `Block` knob when `force_bypass` is empty, or reorder to bypass AFTER this
+/// call, matching `capture_on_session`.
 fn set_knob(s: &mut Session, knob: &LevelKnob, value: f32) -> Result<(), String> {
-    match knob {
-        LevelKnob::PresetLevel => {
-            s.set_preset_level(value)?;
-            Ok(())
-        }
-        LevelKnob::Block {
-            group_id,
-            node_id,
-            parameter_id,
-            scene_slot,
-        } => {
-            if let Some(scene) = scene_slot {
-                // Per-scene leveling: activate the scene, then enable scene mode on this
-                // block so its params become scene-specific. Scene mode MUST be enabled
-                // before the value write — otherwise the write hits the BASE/global
-                // value and leaks across scenes (HW). It's re-asserted on EVERY
-                // connection (scene + scene-edit don't survive the leveller's
-                // reconnects). The settles must stay SHORT: the device silently drops
-                // the write past ~700 ms after `loadScene` (see
-                // `SETTLE_AFTER_SCENE_EDIT_MS`); the rare too-fast leak-to-base race
-                // is covered by the verify + correction pass.
-                s.load_scene(*scene)?;
-                std::thread::sleep(Duration::from_millis(SETTLE_AFTER_SCENE_RECALL_MS));
-                s.set_node_scene_edit(group_id, node_id, true)?;
-                std::thread::sleep(Duration::from_millis(SETTLE_AFTER_SCENE_EDIT_MS));
-            }
-            s.change_parameter(group_id, node_id, parameter_id, value)
-        }
-    }
+    set_knobs(s, &[(knob, value)])
 }
 
 /// Write ONLY the knob value (no scene re-activation) — the live loop's
@@ -1354,14 +1463,30 @@ fn set_knob_value_only(s: &mut Session, knob: &LevelKnob, value: f32) -> Result<
     }
 }
 
-/// Write a SET of block knobs that all belong to the SAME scene, doing the scene
-/// recall + per-block Scene Edit ONCE up front (NOT per knob — calling `set_knob`
-/// per knob re-`load_scene`s between writes, which reverts the prior knob's unsaved
-/// value). Ordering mirrors `set_knob` but batched, so the scene-edit-before-write
-/// rule holds for every block at once: load scene → enable Scene Edit on every
-/// per-scene block → ONE settle → write every value. Base/`PresetLevel` knobs
-/// (no `scene_slot`) write directly. The settle-race that leaks to the base scene
-/// (see `SETTLE_AFTER_SCENE_EDIT_MS`) is paid once, covering all knobs.
+/// Write a SET of block knobs that all belong to the SAME scene (or all to base),
+/// doing the scene recall ONCE up front (NOT per knob — calling this per knob
+/// individually re-`load_scene`s between writes, which reverts the prior knob's
+/// unsaved value; `restore_redistribution` groups its knobs by scene for exactly
+/// this reason). Ordering: load scene → (per-scene only) enable Scene Edit on
+/// every per-scene block → ONE settle → write every value.
+///
+/// * A target set with a `Block { scene_slot: Some(n), .. }` recalls scene `n`,
+///   then enables Scene Edit on every per-scene block so its params become
+///   scene-specific — MUST happen before the value write, or the write hits the
+///   BASE/global value and leaks across scenes (HW). Re-asserted on EVERY
+///   connection (scene + scene-edit don't survive the leveller's reconnects).
+///   The settles must stay SHORT: the device silently drops the write past
+///   ~700 ms after `loadScene` (see `SETTLE_AFTER_SCENE_EDIT_MS`); the rare
+///   too-fast leak-to-base race is covered by the verify + correction pass.
+/// * A base-only target set (`Block { scene_slot: None, .. }`, no `Some`) gets
+///   an explicit base recall — a bare write with no preceding `loadScene` lands
+///   in whatever scene the connection defaults to (the preset's saved
+///   `lastLoadedScene`), not necessarily base (HW). No Scene Edit: base params
+///   are never scene-specific.
+/// * A `PresetLevel`-only target set gets NO recall at all: `setPresetLevel` is
+///   a different wire message and a global multiplier, not a scene-scoped
+///   `changeParameter`, so a recall there would only risk reverting an unsaved
+///   presetLevel write for no benefit.
 fn set_knobs(s: &mut Session, targets: &[(&LevelKnob, f32)]) -> Result<(), String> {
     let scene = targets.iter().find_map(|(k, _)| match k {
         LevelKnob::Block {
@@ -1369,6 +1494,15 @@ fn set_knobs(s: &mut Session, targets: &[(&LevelKnob, f32)]) -> Result<(), Strin
             ..
         } => Some(*slot),
         _ => None,
+    });
+    let has_base_block = targets.iter().any(|(k, _)| {
+        matches!(
+            k,
+            LevelKnob::Block {
+                scene_slot: None,
+                ..
+            }
+        )
     });
     if let Some(scene) = scene {
         s.load_scene(scene)?;
@@ -1385,6 +1519,8 @@ fn set_knobs(s: &mut Session, targets: &[(&LevelKnob, f32)]) -> Result<(), Strin
             }
         }
         std::thread::sleep(Duration::from_millis(SETTLE_AFTER_SCENE_EDIT_MS));
+    } else if has_base_block {
+        recall_base(s)?;
     }
     for (k, v) in targets {
         set_knob_value_only(s, k, *v)?;
@@ -1524,6 +1660,7 @@ pub struct FootswitchWriteSpec {
     pub custom_label: String,
     pub link_group: u32,
     pub is_active: bool,
+    pub switch_type: u32,
 }
 
 /// How `level_footswitch` persists the solved value.
@@ -1884,6 +2021,19 @@ pub fn level_footswitch(
 /// lets it lapse; HW `probe --repro-chunked`). Each write keeps its confirm gate
 /// (field-54 echo / read-back, retry-once, never save on `presetError`); ANY
 /// unconfirmed write aborts BEFORE the save, so nothing half-applied persists.
+///
+/// KNOWN GAP (deliberately NOT fixed here, unlike `set_knob`/`set_knobs`/
+/// `capture_full_at`): `FsWrite::Bake`'s writes are base-context `changeParameter`
+/// calls with no preceding `load_scene`, so they're exposed to the same
+/// leaks-to-`lastLoadedScene` bug those seams fix. A single `load_scene
+/// (BASE_SCENE_SLOT)` before the `pending` loop would close it — BUT `pending`
+/// can carry several confirm-gated writes (`FsWrite::Assign`'s own retry-once
+/// already costs up to 2×(set + 3×200 ms poll) ≈ 1.8 s for ONE item), and the
+/// device silently drops a scene write past ~700 ms after `loadScene`
+/// (`SETTLE_AFTER_SCENE_EDIT_MS`'s doc). Adding the recall without first
+/// HW-bisecting the batch's real elapsed time risks a WORSE regression: later
+/// items in a multi-switch batch silently failing to land instead of the
+/// current wrong-scene bug. Land the recall in its own HW-verified commit.
 pub fn write_footswitch_values(slot: u32, pending: &[FsPendingWrite]) -> Result<(), String> {
     if pending.is_empty() {
         return Ok(());
@@ -1910,7 +2060,7 @@ pub fn write_footswitch_values(slot: u32, pending: &[FsPendingWrite]) -> Result<
                     "func": "param", "groupId": group, "nodeId": node, "parameterId": param,
                     "valueA": p.value, "valueB": value_b, "valueType": 2,
                     "colorA": spec.color_a, "colorB": spec.color_b,
-                    "customLabel": spec.custom_label, "switchType": 0,
+                    "customLabel": spec.custom_label, "switchType": spec.switch_type,
                     "isActive": spec.is_active, "linkGroup": spec.link_group
                 })
                 .to_string();
@@ -4373,5 +4523,123 @@ mod tests {
     #[test]
     fn level_unchanged_false_on_negative_previous() {
         assert!(!super::level_unchanged(0.5, -1.0));
+    }
+
+    // (A3) A base block knob write must recall base explicitly — a preset loads
+    // into its saved lastLoadedScene, not necessarily base (HW), so a bare write
+    // with no recall would silently land wherever that saved scene left it.
+    #[test]
+    fn set_knob_base_block_recalls_base_explicitly() {
+        let sim = crate::sim_device::SimDevice::new().with_saved_scene(30, Some(3));
+        let mut s = Session::from_transport(Box::new(sim.clone()));
+        s.load_preset(30).expect("load_preset"); // activates saved scene 3, not base
+        let knob = LevelKnob::Block {
+            group_id: "G1".into(),
+            node_id: "amp".into(),
+            parameter_id: "outputLevel".into(),
+            scene_slot: None,
+        };
+        set_knob(&mut s, &knob, 0.6).expect("set_knob");
+        let ev = sim.events();
+        assert!(
+            ev.iter().any(|e| matches!(
+                e,
+                crate::sim_device::SimEvent::ChangeParameter {
+                    scene: crate::sim_device::SCENE_BASE,
+                    param,
+                    ..
+                } if param == "outputLevel"
+            )),
+            "a base block knob must write scene_base, not the leftover saved scene 3: {ev:?}"
+        );
+    }
+
+    // Same fix, batched path: a base-only `set_knobs` target set must ALSO recall
+    // base explicitly, not rely on the connection's default scene.
+    #[test]
+    fn set_knobs_base_only_batch_recalls_base_explicitly() {
+        let sim = crate::sim_device::SimDevice::new().with_saved_scene(30, Some(3));
+        let mut s = Session::from_transport(Box::new(sim.clone()));
+        s.load_preset(30).expect("load_preset");
+        let knob = LevelKnob::Block {
+            group_id: "G1".into(),
+            node_id: "amp".into(),
+            parameter_id: "outputLevel".into(),
+            scene_slot: None,
+        };
+        set_knobs(&mut s, &[(&knob, 0.6)]).expect("set_knobs");
+        let ev = sim.events();
+        assert!(
+            ev.iter().any(|e| matches!(
+                e,
+                crate::sim_device::SimEvent::ChangeParameter {
+                    scene: crate::sim_device::SCENE_BASE,
+                    param,
+                    ..
+                } if param == "outputLevel"
+            )),
+            "a base-only set_knobs batch must write scene_base: {ev:?}"
+        );
+    }
+
+    // A PresetLevel-only batch gets NO recall — setPresetLevel is a global
+    // multiplier, not a scene-scoped changeParameter, so a recall would only risk
+    // reverting an unsaved presetLevel write for no benefit.
+    #[test]
+    fn set_knobs_preset_level_only_gets_no_recall() {
+        let sim = crate::sim_device::SimDevice::new().with_saved_scene(30, Some(3));
+        let mut s = Session::from_transport(Box::new(sim.clone()));
+        s.load_preset(30).expect("load_preset");
+        set_knobs(&mut s, &[(&LevelKnob::PresetLevel, 0.5)]).expect("set_knobs");
+        let ev = sim.events();
+        assert!(
+            !ev.iter()
+                .any(|e| matches!(e, crate::sim_device::SimEvent::LoadScene(_))),
+            "a PresetLevel-only batch must not recall any scene: {ev:?}"
+        );
+    }
+
+    // A multi-lane redistribution restore (≥2 base knobs, e.g. a parallel-merged
+    // preset's two amps) must recall base ONCE for the whole group, not once per
+    // knob — a per-knob `set_knob` loop would re-`load_scene(BASE)` between
+    // writes, reverting the earlier knob's just-written value before the batch
+    // ever saves.
+    #[test]
+    fn write_grouped_knobs_recalls_base_once_for_multiple_base_knobs() {
+        let sim = crate::sim_device::SimDevice::new();
+        let mut s = Session::from_transport(Box::new(sim.clone()));
+        s.load_preset(30).expect("load_preset");
+        let knobs = vec![
+            PrevKnobWrite {
+                group_id: "G1".into(),
+                node_id: "amp1".into(),
+                scene_slot: None,
+                value: 0.6,
+            },
+            PrevKnobWrite {
+                group_id: "G1".into(),
+                node_id: "amp2".into(),
+                scene_slot: None,
+                value: 0.7,
+            },
+        ];
+        write_grouped_knobs(&mut s, &knobs).expect("write_grouped_knobs");
+        let ev = sim.events();
+        let base_recalls = ev
+            .iter()
+            .filter(|e| matches!(e, crate::sim_device::SimEvent::LoadScene(scene) if *scene == crate::session::BASE_SCENE_SLOT))
+            .count();
+        assert_eq!(
+            base_recalls, 1,
+            "two base knobs must share ONE base recall, not one each: {ev:?}"
+        );
+        // Both knobs' values must have actually landed (not reverted by a
+        // redundant recall).
+        assert!(ev.iter().any(
+            |e| matches!(e, crate::sim_device::SimEvent::ChangeParameter { node, .. } if node == "amp1")
+        ));
+        assert!(ev.iter().any(
+            |e| matches!(e, crate::sim_device::SimEvent::ChangeParameter { node, .. } if node == "amp2")
+        ));
     }
 }
