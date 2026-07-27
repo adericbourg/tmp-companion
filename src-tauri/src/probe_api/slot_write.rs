@@ -1,6 +1,7 @@
 //! Probe entry points: preset write ops (import / clear / map / diag) + block discovery + bulk apply + connect/firmware.
 
 use super::songs::read_song_presets;
+use super::SCRATCH_SLOTS;
 use crate::bulk_cmd;
 use crate::bulkrun;
 use crate::leveller;
@@ -17,6 +18,324 @@ use crate::{format_dry_run, io_for_path, library_categories, targets_from_librar
 pub fn probe_connect_and_list() -> Result<Vec<PresetEntry>, String> {
     let mut s = Session::connect()?;
     s.list_my_presets()
+}
+
+/// HW PROBE (WRITE): set the global `sceneChangeBehavior` (SettingsMessage field 83).
+///
+/// Rides TMS 3, the same branch `reampModeActive` (field 30) proves is served for
+/// that field specifically — this does not itself prove field 83 is served.
+///
+/// `value` is the `SceneChangeBehavior::Behavior` enum: keys `Retain`, `Revert`
+/// from the client's Qt MOC table. The **ordinal** (`0 = Retain`) is already settled
+/// by direct touchscreen observation, not by this write — see open-questions.md A6.
+/// Calls [`Session::begin_live_edit`] before writing, closing the confound a past
+/// attempt on an unwarmed line left open. Retested 2026-07-26 on a warmed session:
+/// still no observable change — see open-questions.md A6 for both results.
+///
+/// GLOBAL setting — the caller MUST restore the original value.
+pub fn probe_set_scene_change_behavior(value: u64) -> Result<String, String> {
+    // The enum has exactly two keys; anything else would write an out-of-range
+    // ordinal into a global the user has to live with.
+    if value > 1 {
+        return Err(format!(
+            "refusing sceneChangeBehavior={value}: the Behavior enum has exactly two \
+             keys (Retain, Revert) in the 1.8.45 client's MOC table"
+        ));
+    }
+    let mut s = Session::connect()?;
+    s.drain_until_quiet(300, 20)?;
+    s.begin_live_edit()?;
+    let dump = s.send_and_dump(&proto::set_scene_change_behavior(value), 600)?;
+    Ok(format!(
+        "sceneChangeBehavior <- {value} sent.\n\
+         Verify: probe --device-backup → settingsBackup.sceneChangeBehavior\n\
+         reply stream (informational):\n{dump}"
+    ))
+}
+
+/// HW PROBE (working-copy WRITE): set one block parameter on a SCRATCH preset.
+///
+/// Deliberately does ONE thing per invocation. An earlier attempt drove the whole
+/// C2 experiment (read → edit → scene round trip → re-read) inside a single
+/// connection and could not be trusted: `best_json_payload` returns the best
+/// payload accumulated so far, so a second read in the same session can serve the
+/// handshake's snapshot rather than live state — which would silently compare a
+/// value against itself.
+///
+/// The reliable shape instead uses ONE SESSION PER STEP, because a working-copy
+/// edit PERSISTS on the device across USB reconnects (established with
+/// `switchTemplate`). Every read then rides a fresh handshake and is genuinely live:
+///
+/// ```text
+/// probe --set-param 400 G1 ACD_TubeScreamer level 0.125
+/// probe --dump-currentpresetdata      # confirm the edit landed
+/// probe --loadscene 1 ; probe --loadscene 0
+/// probe --dump-currentpresetdata      # retained or reverted?
+/// ```
+///
+/// Nothing is saved. Discard the working copy afterwards by loading another preset.
+pub fn probe_set_param(
+    slot: u32,
+    group: &str,
+    node: &str,
+    param: &str,
+    value: f32,
+) -> Result<String, String> {
+    if !SCRATCH_SLOTS.contains(&slot) {
+        return Err(format!(
+            "refusing --set-param on {slot}: scratch-zone only {SCRATCH_SLOTS:?}"
+        ));
+    }
+    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+        return Err(format!(
+            "refusing value {value}: block parameters are normalised 0.0..=1.0"
+        ));
+    }
+    let mut s = Session::connect()?;
+    s.load_preset(slot)?;
+    std::thread::sleep(std::time::Duration::from_millis(700));
+    // Recall BASE explicitly before the write. A preset loads into its SAVED
+    // `lastLoadedScene`, so a bare `changeParameter` lands in whatever scene overlay
+    // that happens to be — never base by default (HW-confirmed, fw 1.8.45). Hoisted
+    // ABOVE the first write of this connection: a recall AFTER a write reverts it.
+    // Same fix `set_knob`/`set_knobs`/`capture_full_at` already carry.
+    s.load_scene(session::BASE_SCENE_SLOT)?;
+    std::thread::sleep(std::time::Duration::from_millis(
+        leveller::SETTLE_AFTER_SCENE_RECALL_MS,
+    ));
+    // Use the SESSION method, not a hand-rolled `send_and_dump(proto::change_parameter(..))`.
+    // The session wrapper is the path the leveller drives on every run; sending the
+    // bare message skipped its bookkeeping and the edit silently did not land — the
+    // parameter read back unchanged with no error reported.
+    s.change_parameter(group, node, param, value)?;
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    Ok(format!(
+        "changeParameter {group}/{node}/{param} <- {value} (slot {slot}, working copy).\n\
+         Verify on a SEPARATE invocation: probe --dump-currentpresetdata\n"
+    ))
+}
+
+/// HW PROBE (read-only): fire a settings sub-request on TMS 3 and dump the reply.
+///
+/// Exists as the discriminator the device backup cannot provide: a backup shows
+/// *persisted* state, so an ignored write and a landed-but-unflushed write look
+/// identical there. A live read separates them.
+///
+/// `footswitchSettingsRequest` (47) is the one that matters for scene behaviour —
+/// `FootswitchSettings.sceneChangeBehavior` is field 12 of the reply.
+pub fn probe_settings_read(field: u32) -> Result<String, String> {
+    let mut s = Session::connect()?;
+    // Same drain rule as every other read: a request fired into the handshake
+    // flood is dropped, which reads as a false negative.
+    s.drain_until_quiet(300, 20)?;
+    let dump = s.send_and_dump(&proto::settings_request(field), 900)?;
+    Ok(format!("SettingsMessage field {field} request →\n{dump}"))
+}
+
+/// HW PROBE (WRITE): switch the signal-path template of a SCRATCH preset
+/// (`PresetMessage.switchTemplate`, field 43).
+///
+/// Settles what happens to per-scene state when the template changes — the manual
+/// says only that it "repopulates the signal path" and "will affect all Scenes",
+/// never whether per-scene bypass/parameter overrides are preserved, remapped or
+/// wiped.
+///
+/// Scratch-guarded: this is a destructive edit if the device auto-saves, and
+/// whether it does is one of the unknowns. Does NOT load `slot` itself — see the
+/// active-preset check below for why an explicit load can't substitute for it.
+pub fn probe_switch_template(slot: u32, template_type: &str) -> Result<String, String> {
+    if !SCRATCH_SLOTS.contains(&slot) {
+        return Err(format!(
+            "refusing switchTemplate on {slot}: scratch-zone only {SCRATCH_SLOTS:?} \
+             (a template switch repopulates the signal path and may not be undoable)"
+        ));
+    }
+    let mut s = Session::connect()?;
+    // Confirm identity through the mutation path's own read — never a caller-
+    // supplied assumption (same discipline as `probe_move_preset` below). This
+    // function used to just trust that the caller had already loaded `slot` in a
+    // prior session; nothing enforced it, so switchTemplate could land on
+    // whatever preset the unit actually had open. An explicit `load_preset(slot)`
+    // here isn't a substitute fix: loading the ALREADY-current preset emits no
+    // field-3 push at all (see the `Some(slot)` note below), so it wouldn't move
+    // the risk, only hide it behind a call that looks like it helped.
+    //
+    // Compares `info.preset_id`, NOT `info.displayName` — displayName is
+    // user-editable and duplicates are allowed (see this skill's own documented
+    // invariant: preset identity is the UUID, never the label), so a name-only
+    // check could pass while a different, same-named preset is actually active.
+    // The field-8 read is on a QUIET line (its own drain, like `probe_roster`),
+    // BEFORE the undrained capture below — the two don't interleave.
+    s.drain_until_quiet(250, 20)?;
+    let expected_raw = s
+        .read_slot_preset_json(slot + 1)?
+        .ok_or_else(|| format!("list index {slot}: no presetJson on the device (empty slot?)"))?;
+    let expected_json = session::tolerant_parse_json(&String::from_utf8_lossy(&expected_raw))
+        .ok_or_else(|| format!("list index {slot}: presetJson did not parse"))?;
+    let expected_id = expected_json
+        .pointer("/info/preset_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("list index {slot}: presetJson has no info.preset_id"))?
+        .to_string();
+    let expected_name = expected_json
+        .pointer("/info/displayName")
+        .and_then(|v| v.as_str())
+        .unwrap_or("<unnamed>")
+        .to_string();
+    // NO pre-drain here. `capture_full_preset_json` waits for the field-3
+    // currentPresetDataChanged PUSH, and `drain_until_quiet` eats exactly that —
+    // draining first made the capture fail with "no payload captured". This is the
+    // mirror image of the read-request rule (requests need a quiet line; pushes
+    // must not be drained away).
+
+    // Read BEFORE and AFTER on THIS connection. A template switch is very likely a
+    // working-copy edit (same class as force-bypass), and a working-copy edit is
+    // discarded by the reload a fresh connection performs — so a cross-connection
+    // read cannot distinguish "unserved" from "applied then discarded". Only a
+    // same-connection pair can.
+    //
+    // `capture_full_preset_json` (the dense-heartbeat capture), NOT
+    // `fetch_current_preset_json`: the latter returns empty on a plain session, and
+    // an empty read compared against an empty read silently looks like "unchanged".
+    // The AFTER read passes `None` so it captures the CURRENT working copy without
+    // reloading — a reload would discard the very edit being measured.
+    // `Some(slot)` would RE-load the preset, and re-loading the preset that is
+    // already current emits no push at all, so the capture times out. Ride the
+    // handshake's own push instead (`None`).
+    let before = String::from_utf8_lossy(&s.capture_full_preset_json(None, 3000)?).into_owned();
+
+    // Verify identity BEFORE writing, from the same read the "before" comparison
+    // already needs — never trust that the caller loaded the right preset earlier.
+    // Compares preset_id (the canonical identity); displayName is extracted too,
+    // but only for the error message — it's context, not the check.
+    let field_of = |j: &str, key: &str| {
+        let needle = format!("\"{key}\":\"");
+        j.find(&needle).and_then(|i| {
+            let r = &j[i + needle.len()..];
+            r.find('"').map(|e| r[..e].to_string())
+        })
+    };
+    let active_name = field_of(&before, "displayName").unwrap_or_else(|| "<unknown>".into());
+    match field_of(&before, "preset_id") {
+        Some(id) if id == expected_id => {}
+        Some(_) => {
+            return Err(format!(
+                "refusing switchTemplate: active preset is {active_name:?}, not \
+                 {expected_name:?} (list index {slot}) — load the scratch preset first"
+            ));
+        }
+        None => {
+            return Err(format!(
+                "refusing switchTemplate: could not read the active preset's preset_id from \
+                 the pre-switch capture, so identity against list index {slot} \
+                 ({expected_name:?}) could not be confirmed"
+            ));
+        }
+    }
+
+    let dump = s.send_and_dump(&proto::switch_template(template_type), 1500)?;
+    std::thread::sleep(std::time::Duration::from_millis(800));
+    // Non-fatal: if switchTemplate is ignored there is no push to capture, and a
+    // timeout here is itself a data point rather than an error to abort on.
+    let after = s
+        .capture_full_preset_json(None, 3000)
+        .map(|v| String::from_utf8_lossy(&v).into_owned())
+        .unwrap_or_default();
+
+    // Substring-scan rather than JSON-parse: currentPresetDataJson is TRUNCATED on
+    // this firmware (~5 KB), so serde would fail on a reply that still carries the
+    // one field being measured.
+    // Reuses `field_of` above rather than re-deriving the scan: the old copy carried a
+    // hand-counted `i + 12` offset for `"template":"` that would silently mis-slice if
+    // the key were ever renamed. Same unterminated-value-reads-as-absent semantics.
+    let tpl = |j: &str| field_of(j, "template").unwrap_or_else(|| "<absent>".into());
+    let (b, a) = (tpl(&before), tpl(&after));
+    // An absent read is NOT evidence of "unchanged" — two failed reads compare
+    // equal and would otherwise manufacture a false negative. Say inconclusive.
+    let verdict = if b == "<absent>" || a == "<absent>" {
+        "INCONCLUSIVE — a read returned no template field; the comparison proves nothing"
+    } else if a == b {
+        "NO CHANGE — switchTemplate not applied even on the same connection"
+    } else {
+        "TEMPLATE CHANGED — switchTemplate is served"
+    };
+    Ok(format!(
+        "switchTemplate({template_type}) on slot {slot}, SAME-connection read-back:\n  \
+         template before = {b}  ({} B read)\n  template after  = {a}  ({} B read)\n  \
+         verdict: {verdict}\n\
+         reply stream (templateSwitched is field 44):\n{dump}",
+        before.len(),
+        after.len()
+    ))
+}
+
+/// HW PROBE (DEVICE WRITE): reorder a user preset, `from` → `to` (0-based list
+/// indices). The device renumbers presets automatically; whether it also rewrites
+/// slot-keyed Song/Setlist bindings is the open question this exists to settle.
+///
+/// **Confirms identity through the mutation path's own read**, before and after —
+/// never a caller-supplied label. It reads the live `list_my_presets` on the same
+/// connection that performs the move, prints what actually occupies both indices,
+/// and reports the post-move occupants so a caller can diff. An earlier off-by-one
+/// destroyed a real preset; a printed label is not identity.
+///
+/// **Scratch-zone only.** A reorder outside 400/401/402 shifts real user presets,
+/// so anything else is refused rather than trusted to the caller.
+pub fn probe_move_preset(from: u32, to: u32) -> Result<String, String> {
+    if !SCRATCH_SLOTS.contains(&from) || !SCRATCH_SLOTS.contains(&to) {
+        return Err(format!(
+            "refusing move {from}→{to}: probe reorder is scratch-zone only {SCRATCH_SLOTS:?} \
+             (a reorder outside it renumbers real presets)"
+        ));
+    }
+    if from == to {
+        return Err("refusing move: from == to (nothing to reorder)".into());
+    }
+
+    let mut s = Session::connect()?;
+    fn name_at(list: &[PresetEntry], idx: u32) -> String {
+        list.iter()
+            .find(|p| p.slot == idx)
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| "<empty>".into())
+    }
+
+    let before = s.list_my_presets()?;
+    let (from_name, to_name) = (name_at(&before, from), name_at(&before, to));
+    if from_name == "<empty>" {
+        return Err(format!(
+            "refusing move: list index {from} reads empty — nothing to reorder"
+        ));
+    }
+    let mut out = format!("before: [{from}]={from_name:?}  [{to}]={to_name:?}\n");
+
+    s.move_user_preset(from, to)?;
+    std::thread::sleep(std::time::Duration::from_millis(800));
+    out += &format!(
+        "presetError seen on the write connection: {}\n",
+        s.saw_preset_error()
+    );
+    drop(s);
+
+    // Verify on a FRESH connection: a same-connection re-list can serve the
+    // pre-move state, so a no-op and a stale read are otherwise indistinguishable.
+    std::thread::sleep(std::time::Duration::from_millis(800));
+    let mut s = Session::connect()?;
+    let after = s.list_my_presets()?;
+    out += &format!(
+        "after:  [{from}]={:?}  [{to}]={:?}\n",
+        name_at(&after, from),
+        name_at(&after, to)
+    );
+    out += &format!(
+        "moved {from_name:?} → {}\n",
+        if name_at(&after, to) == from_name {
+            "landed at the destination index"
+        } else {
+            "NOT at the destination index — reorder did not land as expected"
+        }
+    );
+    Ok(out)
 }
 
 /// Headless firmware-version read (`probe --fw`): connect, request the version
@@ -222,7 +541,13 @@ pub fn probe_clear_preset(slot: u32, expect_name: &str) -> Result<String, String
             "[probe --clear] slot {slot} reads {cur:?}, not {expect_name:?} — refused (no change)\n"
         ));
     }
+    // Deliberately NOT `confirm_slot_name`: this path reports a refusal as an `Ok`
+    // message so `probe --clear` exits 0 on a mismatch. Only the recycle gaps are
+    // shared — three back-to-back `connect()`s with no gap is the shape that lands in
+    // the exclusive-open lockout (`0xe00002c5`).
+    std::thread::sleep(std::time::Duration::from_millis(leveller::RECONNECT_GAP_MS));
     Session::connect()?.clear_user_preset(slot)?;
+    std::thread::sleep(std::time::Duration::from_millis(leveller::RECONNECT_GAP_MS));
     let after = Session::connect()?.list_my_presets()?;
     let now = after
         .iter()
@@ -776,6 +1101,33 @@ fn restore_scratch(
     )
 }
 
+/// Confirm `slot` still holds `expect_name` before a destructive write, then wait the
+/// device's session-recycle gap.
+///
+/// Shared by every slot-keyed destructive probe path so the guard cannot drift between
+/// copies — the same consolidation `SCRATCH_SLOTS` got. The read is non-destructive and
+/// happens in the SAME address space as the mutation it protects, which is the whole
+/// point: a `clear` once deleted a real preset because its guard checked list-index
+/// space while the op acted in device-slot space.
+///
+/// The trailing sleep is part of the contract, not a caller's concern: the guard session
+/// is dropped at the end of the read, and re-opening immediately after a close is the
+/// shape that lands in the exclusive-open lockout (`0xe00002c5`).
+fn confirm_slot_name(slot: u32, expect_name: &str) -> Result<(), String> {
+    let before = Session::connect()?.list_my_presets()?;
+    let cur = before
+        .iter()
+        .find(|p| p.slot == slot)
+        .map(|p| p.name.clone());
+    if cur.as_deref() != Some(expect_name) {
+        return Err(format!(
+            "slot {slot} reads {cur:?}, not {expect_name:?} — refused (no change)"
+        ));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(leveller::RECONNECT_GAP_MS));
+    Ok(())
+}
+
 /// Write ONE block parameter to a preset and persist it (`probe --set-scene-param`) —
 /// the repair seam for a preset whose scene overlay drifted. Routes through the
 /// leveller's own [`leveller::apply_level`] write path, so `scene = Some(n)` gets the
@@ -830,12 +1182,29 @@ fn restore_scratch(
 /// actually needs it.
 pub fn probe_set_scene_param(
     slot: u32,
+    expect_name: &str,
     scene: Option<u32>,
     group: &str,
     node: &str,
     param: &str,
     value: f32,
 ) -> Result<String, String> {
+    // This SAVES (`save: true` below), so it is destructive on a mis-typed index.
+    // TWO independent guards, because the identity check alone still lets a correct name
+    // authorise a write anywhere in the bank:
+    //   1. scratch-zone restriction — the same allowlist every other destructive probe
+    //      path checks, opt-out-able for the deliberate case;
+    //   2. list-index -> preset mapping confirmed by a non-destructive read, in the SAME
+    //      address space as the mutation (a `clear` once deleted a real preset because
+    //      its guard checked a different index space than the op).
+    if !SCRATCH_SLOTS.contains(&slot) && std::env::var("TMP_ALLOW_NONSCRATCH_WRITE").is_err() {
+        return Err(format!(
+            "refusing --set-scene-param on list index {slot}: outside the scratch zone \
+             {SCRATCH_SLOTS:?} and this SAVES. Re-run with TMP_ALLOW_NONSCRATCH_WRITE=1 if \
+             writing this preset is intended."
+        ));
+    }
+    confirm_slot_name(slot, expect_name)?;
     let knob = leveller::LevelKnob::Block {
         group_id: group.to_string(),
         node_id: node.to_string(),
@@ -888,16 +1257,7 @@ pub fn probe_scene_write_cell(
     // Non-destructive read-back BEFORE any write: confirm the list-index mapping in the
     // SAME address space as the mutation below, so an index mistake refuses instead of
     // silently saving over a real preset (the write-safety lesson this PR series is about).
-    let before = Session::connect()?.list_my_presets()?;
-    let cur = before
-        .iter()
-        .find(|p| p.slot == slot)
-        .map(|p| p.name.clone());
-    if cur.as_deref() != Some(expect_name) {
-        return Err(format!(
-            "slot {slot} reads {cur:?}, not {expect_name:?} — refused (no change)"
-        ));
-    }
+    confirm_slot_name(slot, expect_name)?;
     {
         let mut s = Session::connect()?;
         s.load_preset(slot)?;

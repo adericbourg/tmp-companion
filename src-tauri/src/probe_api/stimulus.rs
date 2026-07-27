@@ -1,5 +1,6 @@
 //! Stimulus WAV I/O + calibration + probe measurement entry points.
 
+use super::SCRATCH_SLOTS as SCRATCH;
 use crate::audio;
 use crate::doctor;
 use crate::footswitch;
@@ -67,6 +68,205 @@ pub fn probe_capture_reference(slot: u32, topology_id: &str, out: &str) -> Resul
     write_wav_mono(out, &mono, rate)?;
     Ok(format!(
         "captured slot {slot} ({} samples = {:.2}s @ {rate} Hz) → {out}\n",
+        mono.len(),
+        mono.len() as f32 / rate as f32
+    ))
+}
+
+/// HW PROBE (WRITE): capture a short stimulus burst plus a long silent `tail_ms`
+/// afterward, so the raw WAV shows a reverb/delay tail's own decay curve directly
+/// — rather than trying to infer contamination risk from the ~1.3 s inter-connection
+/// floor alone (see device-manual-gaps.md gap 6). `scene`, when given, is the
+/// 0-based `scenes[]` wire index to recall after the load (same convention as
+/// `--measure-scene`) — needed to reach a preset's wet SCENE rather than just its
+/// base/default state.
+///
+/// Scratch slots need no override. A non-scratch preset requires
+/// `TMP_ALLOW_NONSCRATCH_TAIL_DECAY=1`: this path writes `PresetLevel` on the
+/// target's WORKING COPY (via `doctor_capture`'s `ref_level`) — unsaved, discarded
+/// on the next reload, but real, so testing a real device-created preset should be
+/// a deliberate opt-in, same as `--reamp-wav`'s `TMP_ALLOW_NONSCRATCH_REAMP`.
+pub fn probe_tail_decay(
+    slot: u32,
+    scene: Option<u32>,
+    stimulus_wav: &str,
+    tail_ms: u64,
+    out: &str,
+) -> Result<String, String> {
+    if !SCRATCH.contains(&slot) && std::env::var("TMP_ALLOW_NONSCRATCH_TAIL_DECAY").is_err() {
+        return Err(format!(
+            "refusing --tail-decay on list index {slot}: outside the scratch zone {SCRATCH:?}, \
+             and this path WRITES (PresetLevel) to the working copy. \
+             Re-run with TMP_ALLOW_NONSCRATCH_TAIL_DECAY=1 if measuring this preset is intended."
+        ));
+    }
+    let stim = read_stimulus_48k(stimulus_wav)?;
+    let (samples, rate) =
+        leveller::doctor_capture(slot, scene, &[], &stim, Some(0.5), tail_ms, false)?;
+    write_wav_mono(out, &samples, rate)?;
+    // The stimulus is 48 kHz by construction (`read_stimulus_48k`); `rate` is the
+    // CAPTURE rate `doctor_capture` returns and need not match it — using `rate`
+    // here would misreport the stimulus duration by their ratio if they differ.
+    let stim_ms = stim.len() as u64 * 1000 / 48_000;
+    Ok(format!(
+        "captured slot {slot} scene {scene:?}: {stim_ms}ms stimulus + {tail_ms}ms tail = {} samples @ {rate} Hz → {out}\n",
+        samples.len()
+    ))
+}
+
+/// HW PROBE: re-amp an **arbitrary** stimulus WAV through `slot` and save the
+/// captured USB 1/2 audio. Sibling of [`probe_capture_reference`], which resolves
+/// its stimulus from the bundled per-topology WAV — this one takes any 48 kHz mono
+/// file, which is what a swept-sine bandwidth test needs.
+///
+/// Read UNNORMALIZED (`read_stimulus_48k`, no LUFS scaling): a chirp's flat drive
+/// per octave is the whole point, and calibration scaling would tilt it.
+///
+/// Band-edge caveat: run it through a CLEAN, effects-free preset. A distorting amp
+/// model generates harmonics that fill the octave above the fundamental sweep and
+/// muddy exactly the band edge the test reads.
+pub fn probe_reamp_wav(
+    slot: u32,
+    stimulus_wav: &str,
+    out: &str,
+    ref_level: f32,
+    bypass_all: bool,
+    bypass_nodes: &str,
+) -> Result<String, String> {
+    // Reject rather than silently clamp: `capture_full_at` clamps ref_level to
+    // 0.05..=1.0 downstream, but the reported string below prints the ARGUMENT,
+    // not the clamped value — so an out-of-range or non-finite level would
+    // measure at one value while claiming another.
+    if !ref_level.is_finite() || !(0.05..=1.0).contains(&ref_level) {
+        return Err(format!(
+            "ref_level {ref_level} must be a finite value in 0.05..=1.0"
+        ));
+    }
+    // THIS IS A WRITE PATH, despite reading like a measurement: `capture_full_at`
+    // sets `bypass` flags and `PresetLevel` on the target preset's working copy
+    // (`leveller.rs`). Nothing is saved — a reload discards it — but the write is
+    // real, so which preset it lands on should be a deliberate choice.
+    //
+    // Measuring a non-scratch preset is sometimes necessary (the unit may hold only
+    // one preset of the template under test), so this is an explicit opt-in rather
+    // than a refusal.
+    if !SCRATCH.contains(&slot) && std::env::var("TMP_ALLOW_NONSCRATCH_REAMP").is_err() {
+        return Err(format!(
+            "refusing --reamp-wav on list index {slot}: outside the scratch zone {SCRATCH:?}, \
+             and this path WRITES (bypass flags + PresetLevel) to the working copy. \
+             Re-run with TMP_ALLOW_NONSCRATCH_REAMP=1 if measuring this preset is intended."
+        ));
+    }
+    let stim = read_stimulus_48k(stimulus_wav)?;
+
+    // Explicit `GROUP/NODE,GROUP/NODE` list — isolates ONE lane of a Split or
+    // Parallel template so a capture can be attributed to a specific lane, which
+    // is what "what actually reaches USB 1/2 on a Split?" needs.
+    if !bypass_nodes.is_empty() {
+        // Reject a token missing GROUP/ rather than silently defaulting to G1 —
+        // a typo'd lane selector would otherwise bypass the wrong group and the
+        // resulting capture would look like a valid but wrong measurement.
+        let forced: Vec<(String, String, bool)> = bypass_nodes
+            .split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(|t| {
+                let (g, n) = t
+                    .split_once('/')
+                    .ok_or_else(|| format!("bypass-nodes token {t:?} is not GROUP/NODE"))?;
+                if g.is_empty() || n.is_empty() {
+                    return Err(format!("bypass-nodes token {t:?} is not GROUP/NODE"));
+                }
+                Ok((g.to_string(), n.to_string(), true))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        // bypass_nodes was non-empty text but every token was blank after
+        // trim/filter (e.g. "," or " , "): reject rather than silently falling
+        // through to an unbypassed capture, which would look like a valid
+        // all-lanes measurement instead of a malformed argument.
+        if forced.is_empty() {
+            return Err(format!(
+                "bypass-nodes={bypass_nodes:?} produced no GROUP/NODE tokens after parsing"
+            ));
+        }
+        let (mono, rate) = leveller::capture_samples_bypassed(slot, &stim, ref_level, &forced)?;
+        write_wav_mono(out, &mono, rate)?;
+        let loud = lufs::measure_mono(&mono, rate)
+            .map(|l| l.integrated_lufs)
+            .unwrap_or(f64::NAN);
+        return Ok(format!(
+            "re-amped {stimulus_wav} through slot {slot} @ level {ref_level} [bypassed {:?}] \
+             → {out}\n  {} samples = {:.2}s @ {rate} Hz, integrated {loud:.3} LUFS\n",
+            forced
+                .iter()
+                .map(|(g, n, _)| format!("{g}/{n}"))
+                .collect::<Vec<_>>(),
+            mono.len(),
+            mono.len() as f32 / rate as f32
+        ));
+    }
+
+    // `bypass_all` turns the preset into approximately a wire, so the capture
+    // reads the PATH's bandwidth instead of the amp model's HF rolloff. The node
+    // list comes from `load_then_discover_blocks` — the SAME level-control list
+    // used elsewhere in this crate — not a full live-graph walk; see the caveat
+    // below for what that means for the "approximately a wire" claim.
+    let mut forced: Vec<(String, String, bool)> = Vec::new();
+    if bypass_all {
+        // Node discovery goes through `load_then_discover_blocks` — the
+        // 1.8.45-safe rich-lean-session path. A plain `connect()` handshake does
+        // NOT reliably carry `currentPresetDataChanged` on this firmware
+        // ("no preset JSON in handshake", HW), so reading the graph directly off
+        // a handshake fails.
+        //
+        // Caveat, reported in the output so it can't be silently over-claimed:
+        // this enumerates blocks that expose a LEVEL-type control. A block with
+        // no level parameter is not in the list and stays active.
+        let blocks = crate::load_then_discover_blocks(slot)?;
+        for b in &blocks {
+            let pair = (b.group_id.clone(), b.node_id.clone(), true);
+            if !forced.contains(&pair) {
+                forced.push(pair);
+            }
+        }
+        // Discovery returning nothing is NOT "nothing to bypass" — it means the
+        // level-control enumeration failed or the preset exposes none. Falling through
+        // would run `capture_samples` and label an UN-bypassed capture as bypassed,
+        // exactly the silent-wrong-measurement the `bypass-nodes` empty-list check
+        // rejects. Refuse instead.
+        if forced.is_empty() {
+            return Err(format!(
+                "bypass: no level-control blocks discovered on slot {slot}, so nothing would be \
+                 bypassed — refusing rather than capturing an unbypassed take labelled bypassed"
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(400));
+    }
+
+    let (mono, rate) = if forced.is_empty() {
+        leveller::capture_samples(slot, &stim, ref_level)?
+    } else {
+        leveller::capture_samples_bypassed(slot, &stim, ref_level, &forced)?
+    };
+    write_wav_mono(out, &mono, rate)?;
+    let loud = lufs::measure_mono(&mono, rate)
+        .map(|l| l.integrated_lufs)
+        .unwrap_or(f64::NAN);
+    Ok(format!(
+        "re-amped {stimulus_wav} through slot {slot} @ level {ref_level}{} → {out}\n  \
+         {} samples = {:.2}s @ {rate} Hz, integrated {loud:.3} LUFS\n",
+        if forced.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " [force-bypassed {}: {:?}]",
+                forced.len(),
+                forced
+                    .iter()
+                    .map(|(g, n, _)| format!("{g}/{n}"))
+                    .collect::<Vec<_>>()
+            )
+        },
         mono.len(),
         mono.len() as f32 / rate as f32
     ))

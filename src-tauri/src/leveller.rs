@@ -71,7 +71,7 @@ pub const DOCTOR_TAIL_MS: u32 = 1500;
 /// LEVELING window does not apply here.
 pub const DOCTOR_STIM_MS: usize = 3000;
 
-/// [`DOCTOR_STIM_MS`] at the device clock ([`RATE`]), in samples.
+/// [`DOCTOR_STIM_MS`] at the required host Core Audio rate ([`RATE`]), in samples.
 pub fn doctor_stim_samples() -> usize {
     (RATE as usize / 1000) * DOCTOR_STIM_MS
 }
@@ -85,7 +85,7 @@ pub fn doctor_stim_samples() -> usize {
 /// drops silence, and the body PSD starts at [`doctor_signal_start`].
 pub const DOCTOR_PAD_MS: usize = 200;
 
-/// [`DOCTOR_PAD_MS`] at the device clock, in samples.
+/// [`DOCTOR_PAD_MS`] at the required host Core Audio rate, in samples.
 pub fn doctor_pad_samples() -> usize {
     (RATE as usize / 1000) * DOCTOR_PAD_MS
 }
@@ -144,7 +144,7 @@ const SETTLE_AFTER_SCENE_EDIT_MS: u64 = 300;
 // fire-and-forget, so nothing surfaced). HW-bisected lower edge (`probe
 // --bisect-scene`, fw 1.8.45): scene_settle 150, 100, and even 50 all land ON the
 // scene overlay (never leak to base) and persist — 150 keeps ~2× margin on both sides.
-const SETTLE_AFTER_SCENE_RECALL_MS: u64 = 150;
+pub(crate) const SETTLE_AFTER_SCENE_RECALL_MS: u64 = 150;
 const RATE: u32 = 48_000;
 const LEVEL_MIN: f32 = 0.0;
 const LEVEL_MAX: f32 = 1.0;
@@ -628,6 +628,37 @@ pub fn capture_samples(
     ref_level: f32,
 ) -> Result<(Vec<f32>, u32), String> {
     let cap = capture_full(slot, stimulus, ref_level)?;
+    let (ch, _) = cap.loudest_channel();
+    Ok((cap.channel(ch), cap.sample_rate))
+}
+
+/// [`capture_samples`] with a caller-supplied force-bypass list, so a probe can
+/// measure the re-amp PATH rather than a preset's tone.
+///
+/// Why this is needed: a bandwidth test through a normal preset measures the
+/// AMP's HF rolloff, not the transport's. Measured on fw 1.8.45, a
+/// TubeScreamer→Plexi chain puts the capture 49 dB down by 16 kHz and at the
+/// float floor by 22 kHz — which mimics a band-limit cliff that may not be there.
+/// Bypassing every block makes the chain approximately a wire, so whatever
+/// reaches 20–24 kHz is a property of the path, not of the tone.
+///
+/// Uses the same `capture_full_at` ordering as the leveller's own force-bypass
+/// callers: the bypasses land after the load, before the engage.
+pub fn capture_samples_bypassed(
+    slot: u32,
+    stimulus: &[f32],
+    ref_level: f32,
+    force_bypass: &[(String, String, bool)],
+) -> Result<(Vec<f32>, u32), String> {
+    let cap = capture_full_at(
+        slot,
+        None,
+        force_bypass,
+        stimulus,
+        Some(ref_level),
+        CAPTURE_TAIL_MS,
+        false,
+    )?;
     let (ch, _) = cap.loudest_channel();
     Ok((cap.channel(ch), cap.sample_rate))
 }
@@ -1508,13 +1539,29 @@ fn set_knob_value_only(s: &mut Session, knob: &LevelKnob, value: f32) -> Result<
 ///   `changeParameter`, so a recall there would only risk reverting an unsaved
 ///   presetLevel write for no benefit.
 fn set_knobs(s: &mut Session, targets: &[(&LevelKnob, f32)]) -> Result<(), String> {
-    let scene = targets.iter().find_map(|(k, _)| match k {
-        LevelKnob::Block {
-            scene_slot: Some(slot),
-            ..
-        } => Some(*slot),
-        _ => None,
-    });
+    // ONE scene per batch, ENFORCED not just documented: only the first scene found is
+    // recalled below, so a batch mixing two scenes would land every write in that first
+    // scene's overlay — silently, with each write confirming normally. Refuse instead.
+    let mut scenes: Vec<u32> = targets
+        .iter()
+        .filter_map(|(k, _)| match k {
+            LevelKnob::Block {
+                scene_slot: Some(slot),
+                ..
+            } => Some(*slot),
+            _ => None,
+        })
+        .collect();
+    scenes.sort_unstable();
+    scenes.dedup();
+    if scenes.len() > 1 {
+        return Err(format!(
+            "set_knobs: batch mixes scenes {scenes:?}; only one scene may be recalled per batch, \
+             so the others would silently write into scene {}",
+            scenes[0]
+        ));
+    }
+    let scene = scenes.first().copied();
     let has_base_block = targets.iter().any(|(k, _)| {
         matches!(
             k,
@@ -1524,6 +1571,19 @@ fn set_knobs(s: &mut Session, targets: &[(&LevelKnob, f32)]) -> Result<(), Strin
             }
         )
     });
+    // ...and no BASE block may ride along with a scene block, for the same reason one step
+    // removed: the branch below recalls the scene whenever `scene` is Some, so a base-scoped
+    // knob (`scene_slot: None`) in that batch would be written under the scene overlay
+    // instead of base — silently, confirming normally, exactly like the two-scene case.
+    // One connection can hold one scene context, so base and scene targets cannot share a
+    // batch; split them into two calls.
+    if scene.is_some() && has_base_block {
+        return Err(format!(
+            "set_knobs: batch mixes base and scene {} targets; the scene recall would capture \
+             the base write too — split them into separate calls",
+            scene.unwrap_or_default()
+        ));
+    }
     if let Some(scene) = scene {
         s.load_scene(scene)?;
         std::thread::sleep(Duration::from_millis(SETTLE_AFTER_SCENE_RECALL_MS));
@@ -4803,6 +4863,64 @@ mod tests {
 
     // Same fix, batched path: a base-only `set_knobs` target set must ALSO recall
     // base explicitly, not rely on the connection's default scene.
+    #[test]
+    fn set_knobs_refuses_a_batch_that_mixes_scenes() {
+        // Only the FIRST scene found is recalled, so a mixed batch would land every
+        // write in that scene's overlay — silently, each write confirming normally.
+        let sim = crate::sim_device::SimDevice::new().with_saved_scene(30, Some(3));
+        let mut s = Session::from_transport(Box::new(sim.clone()));
+        s.load_preset(30).expect("load_preset");
+        let mk = |scene: u32| LevelKnob::Block {
+            group_id: "G1".into(),
+            node_id: "amp".into(),
+            parameter_id: "outputLevel".into(),
+            scene_slot: Some(scene),
+        };
+        let (a, b) = (mk(1), mk(2));
+        let err = set_knobs(&mut s, &[(&a, 0.6), (&b, 0.4)])
+            .expect_err("a batch mixing scenes 1 and 2 must be refused, not silently merged");
+        assert!(
+            err.contains("mixes scenes"),
+            "error should name the mixed-scene cause: {err}"
+        );
+        assert!(
+            !sim.events()
+                .iter()
+                .any(|e| matches!(e, crate::sim_device::SimEvent::ChangeParameter { .. })),
+            "nothing may be written when the batch is refused: {:?}",
+            sim.events()
+        );
+    }
+
+    #[test]
+    fn set_knobs_refuses_a_batch_mixing_base_and_scene() {
+        // The scene branch recalls the scene whenever ANY scene target is present, so a
+        // base-scoped knob riding along would be written under that overlay, not base.
+        let sim = crate::sim_device::SimDevice::new().with_saved_scene(30, Some(3));
+        let mut s = Session::from_transport(Box::new(sim.clone()));
+        s.load_preset(30).expect("load_preset");
+        let mk = |scene: Option<u32>| LevelKnob::Block {
+            group_id: "G1".into(),
+            node_id: "amp".into(),
+            parameter_id: "outputLevel".into(),
+            scene_slot: scene,
+        };
+        let (base, scened) = (mk(None), mk(Some(2)));
+        let err = set_knobs(&mut s, &[(&base, 0.6), (&scened, 0.4)])
+            .expect_err("a batch mixing a base target with a scene target must be refused");
+        assert!(
+            err.contains("mixes base and scene"),
+            "error should name the base/scene mix: {err}"
+        );
+        assert!(
+            !sim.events()
+                .iter()
+                .any(|e| matches!(e, crate::sim_device::SimEvent::ChangeParameter { .. })),
+            "nothing may be written when the batch is refused: {:?}",
+            sim.events()
+        );
+    }
+
     #[test]
     fn set_knobs_base_only_batch_recalls_base_explicitly() {
         let sim = crate::sim_device::SimDevice::new().with_saved_scene(30, Some(3));
