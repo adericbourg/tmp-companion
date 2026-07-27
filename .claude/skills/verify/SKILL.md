@@ -51,9 +51,9 @@ What `gates.sh` **cannot** do for you — attended, hardware-gated, layered on t
   always — in a worktree that's the per-worktree DERIVED port (`TMP_E2E_PORT`, offset off 7600
   since the port-isolation PR), not necessarily 7600; check `$TMP_E2E_PORT` or the e2e.sh log
   line before killing a hardcoded port.
-- **Fresh worktree needs deps before checks, not just before dev.** `bun install` (node_modules
-  is gitignored) before `bunx tsc --noEmit`/`bun run test`; `bun run build` (or stub
-  `dist/index.html`) before any `cargo` gate — `generate_context!` panics without `./dist`.
+- **Fresh worktree needs deps before checks, not just before dev** (CLAUDE.md's "Fresh-clone /
+  worktree traps" section) — `bun install` before typecheck/lint/test/build, `bun run build`
+  before any `cargo` gate.
 - **Online false-green tell:** confirm the server log prints `seeded snapshot from the real
 device` (or `/health` reports `online: true`) before trusting a pass — a stale offline server
   reused under `TMP_E2E_ONLINE=1` looks identical until you check.
@@ -82,6 +82,8 @@ device` (or `/health` reports `online: true`) before trusting a pass — a stale
    identified bug class gets a non-regression gate.
 4. **Evidence over assertion.** A completion report pastes the actual check output (the gate
    name + pass/fail, the online seeded-marker line, the soak ledger) — never a bare "tests pass."
+   The same bar applies to claims about EXTERNAL state (a PR "merged", a review-history pattern):
+   re-query the live source immediately before asserting it, never from memory of an earlier check.
 5. **A fix is not done until the module is swept for the same defect shape, and every part of a
    multi-part finding has landed.** A guard added at the cited line usually has an un-cited twin
    nearby — the same missing check in a sibling branch or fall-through (a `bypass-nodes`
@@ -90,6 +92,12 @@ device` (or `/health` reports `online: true`) before trusting a pass — a stale
    asked for an identity guard AND a scratch-zone restriction; only the guard landed). Grep the
    module for the shape, and re-read the finding's full body, before calling it done. This is the
    author-side counterpart of `.coderabbit.yaml`'s `Behavioral parity` pre-merge check.
+6. **A check's data must be able to exercise the failure it verifies.** A pagination check run
+   against fewer rows than the page size, an edge-case guard tested only on the happy path, or a
+   race check run single-threaded all pass for reasons unrelated to correctness. A documented
+   GraphQL query shipped this way in PR #119: it was run once and "verified", but the fixture had
+   23 items against a page size of 100, so its cursor bug could not manifest. Confirm the fixture
+   crosses the threshold that would trip the bug before trusting green.
 
 See `notes/user-journeys.md` for the journey-coverage map + the bug→gate registry this rule
 enforces, and `notes/e2e-test-plan.md` for the full per-tab scenario inventory.

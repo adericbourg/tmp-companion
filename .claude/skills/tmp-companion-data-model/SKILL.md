@@ -13,7 +13,7 @@ Source: Fender's v1.7 Owner's Manual (49 pp) + Model Guide (127 pp) — the publ
 
 A preset = signal-path template + blocks + per-preset settings + footswitch assigns + EXP assigns + scenes.
 
-> **Preset identity = `presetJson.info.preset_id`** (a UUID, unique per preset; verified unique across all factory presets). It is the stable join key for host-side per-preset metadata — NOT the user-editable `displayName`, NOT the positional slot. The on-device DB stores `presetJson` as PLAINTEXT JSON (the XOR+LZ4 encoding is only the exported `.preset` file). The firmware re-serializes `info` to a FIXED baseline field set (`author, created_at, displayName, preset_id, product_id, source_id, timestamp, version`) on every save — so extra keys injected into `info` survive an import/restore but are DROPPED on the first on-device edit+save (HW round-trip, fw 1.8.45). Durable host metadata therefore lives in a companion sidecar keyed by `preset_id`, not in the preset. (See `tmp-companion-write-safety`'s reference notes for why an in-place edit must preserve `preset_id`.)
+> **Preset identity = `presetJson.info.preset_id`** (a UUID, unique per preset; verified unique across all factory presets). It is the stable join key for host-side per-preset metadata — NOT the user-editable `displayName`, NOT the positional slot. The on-device DB stores `presetJson` as PLAINTEXT JSON (the XOR+LZ4 encoding is only the exported `.preset` file). The firmware re-serializes `info` to a FIXED baseline field set (`author, created_at, displayName, preset_id, product_id, source_id, timestamp, version`) on every save — so extra keys injected into `info` survive an import/restore but are DROPPED on the first on-device edit+save (HW round-trip, fw 1.8.45). Durable host metadata therefore lives in a companion sidecar keyed by `preset_id`, not in the preset. (See `notes/write-safety.md` for why an in-place edit must preserve `preset_id`.)
 
 | Store                       | Capacity | Addressing                                                                                                                                   |
 | --------------------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -74,7 +74,7 @@ There is no `Mic/Line Parallel 2` and no 13th/14th template.
 - **Output Assign**: 3×3 matrix `[Upper Path / Lower Path / USB 1-2] × [Headphones / Output 1 / Output 2]` — independently togglable
 - **Preset MIDI**: up to 5 messages sent on preset load, each = `(channel, PC#, CC#, CC value)`
 - **Preset Spillover**: on/off — do delay/reverb tails continue across preset changes
-- **AMP CTRL 1/2**: maps to the rear-panel AMP CTRL TRS jack (tip=AC1, ring=AC2 — two independent latching contact closures, used as a TRS-to-dual-TS insert cable)
+- **AMP CTRL 1/2**: maps to the rear-panel AMP CTRL TRS jack (tip=AC1, ring=AC2) — see `references/setup-recipes.md` §6 for the wiring/insert-cable detail
 - **Tap tempo scope**: per-preset BPM OR global tempo (Global Settings → Footswitch → Tap Tempo)
 
 ## Cabinet sub-model
@@ -262,7 +262,7 @@ Resets to OFF on power cycle. **Loops 1 and 2 are bypassed in reamp mode** — t
 
 These are validation rules the firmware imposes — useful when mutating presets to know what won't be accepted. The block placement/count caps are enforced by the firmware's control app (as a set of per-restriction check functions the "can be selected" property runs on-read); the audio engine independently enforces only the CPU budget. The companion mirrors the same caps in `src-tauri/src/blockcaps.rs` / `src/views/copy/validateBlockEdit.ts` (see also `src/models/block-classification.md`). The values below are product facts (fw 1.8.45; the rule set is identical back to 1.7.75).
 
-1. **Convolution-reverb limit — 1 per preset**. The cap is on the shared **FFT convolution engine**, broader than "reverb". Membership is an `acdCategory` union: standalone convolutions (`ACD_TMSpring63/65`, `Cathedral`, `HallOfDoom`, `EtherealHall`, room/plate/chamber) **and** amps with baked-in convolution spring reverb (Deluxe/Princeton/Twin/Super Reverb blackface/brownface — the `…CabIRConvRvb` ids). Total 20 members in 1.8.45, 16 in 1.7.75. That is why those amps ship `NoFx`/`Normal` (reverb-free) variants — to free the one convolution slot.
+1. **Convolution-reverb limit — 1 per preset**. The cap is on the shared **FFT convolution engine**, broader than "reverb". Membership is an `acdCategory` union: standalone convolutions (`ACD_TMSpring63/65`, `Cathedral`, `HallOfDoom`, `EtherealHall`, room/plate/chamber) **and** amps with baked-in convolution spring reverb (Deluxe/Princeton/Twin/Super Reverb blackface/brownface — the `…CabIRConvRvb` ids). Total 19 members in 1.8.45, 16 in 1.7.75. That is why those amps ship `NoFx`/`Normal` (reverb-free) variants — to free the one convolution slot.
 2. **Cabinet limit — 2 cabinet-category blocks per preset**. Combo amps, half-stacks, standalone Cabinet blocks, and IR blocks share the same 2 slots. A **dual-cab counts as 2 slots**. This is the firmware truth behind the Owner's-Manual "max 2 IR blocks" line.
 3. **Glooper limit — 2 `ACD_Glooper` blocks per preset** (counted across both signal-chain rows).
 4. **FX-loop coexistence — a rule, not a count.** A per-line-type slot-permission mask (Guitar path → all slots, Mic path → slots 0,1 denied, Split/Mix → all denied) plus a pairwise coexistence matrix (the stereo `FxLoop3_4` excludes individual `FxLoop3`/`FxLoop4`) gate whether a candidate FX-loop block may sit at its slot. The "loops 1–2 before A/D, loops 3–4 after loop 2" ordering is **structural, not a runtime check**: Loops 1–2 are rear-panel fixed loops (not add-block candidates; only `ACD_FxLoop3/4/3_4` have selectable profiles) and the Mic mask denies slots 0–1.
@@ -270,8 +270,8 @@ These are validation rules the firmware imposes — useful when mutating presets
 6. **Loops 1 and 2 are fixed at the start of the Instrument path, BEFORE A/D**. They cannot be moved or placed in mic/line paths — they're for analog pedals that need to interact with pickup impedance (fuzz, Rangemaster-style boost, vintage wah).
 7. **Loops 3 + 4** pair as a single stereo loop OR two mono loops — per-preset choice (`Loop 3 mono`, `Loop 4 mono`, `Loop 3+4 stereo`). Placeable anywhere in the digital signal path after Loop 2. Both inputs cannot be set to off (`Both inputs cannot be set to off.`).
 8. **IR blocks placement**: only after Loop 2 (because they're digital). Count is governed by the cabinet limit above.
-9. **Scenes share blocks**: all scenes in a preset share the same block list, same block order, same signal-path template. Adding/removing/reordering blocks affects all scenes uniformly. Scene slots are capped (`All scene slots full`).
-10. **Splitter/Mixer are template-fixed**: they appear at predetermined positions for parallel templates and cannot be user-added or removed independently. To change parallel topology, change the signal-path template (which repopulates the path).
+9. **Scenes share blocks** — see the Scenes section above; scene slots are capped (`All scene slots full`).
+10. **Splitter/Mixer are template-fixed** — see Signal-path templates section above.
 11. **Other capacity caps** surfaced as firmware rejections: `Cannot add new user preset in populated slot.`, saved block-presets (`BlockPresetLimitReached`), cloud/downloaded presets (`Downloaded Presets Limit Reached`).
 
 ## Operating modes
@@ -283,7 +283,7 @@ Six navigation modes via the left-side touchscreen icons:
 | My Presets      | 504      | user-editable; drag-and-drop reorderable on touchscreen; reachable via MIDI Bank+PC                                                                                                                                                                                                                                                |
 | Favorites       | subset   | star-marked subset of My Presets; separately reorderable but keeps original preset number                                                                                                                                                                                                                                          |
 | Factory Presets | factory  | unnumbered, not directly editable; load → modify → "Save to My Presets"                                                                                                                                                                                                                                                            |
-| Cloud Presets   | 100      | downloaded via the TMP Control desktop app; newest first; not numbered                                                                                                                                                                                                                                                             |
+| Cloud Presets   | 100      | see Store table above (same facts)                                                                                                                                                                                                                                                                                                 |
 | Songs           | 200      | each = up to 6 presets with labeled sections (intro/verse/chorus/solo/outro/…); per-song BPM available (wire mechanism: no dedicated setter — it's the global `SettingsMessage.tapTempoBpm` applied to the active song; song/setlist CRUD is `SongMessage`/`SetlistMessage` field-numbered setters — see `tmp-companion-protocol`) |
 | Setlists        | 50       | each = an **ordered** list of up to 99 Songs (position matters); a song may belong to **many** setlists; add / remove-from / reorder-within a setlist are all supported (wire: `addSetlistSong` (global slot) / `removeSetlistSong` / `moveSetlistSong` (1-based position) — see `tmp-companion-protocol`)                         |
 
@@ -318,7 +318,7 @@ The firmware exposes the following screens / modals. Each is a _product surface_
 
 ## Why this matters for the companion
 
-- **Copy** (`src/views/copy/copyModel.ts` + `audiograph.rs`): a preset is a signal-path template + block list + per-block `(model_id, params, bypass, scene_edit_flag)` + scenes (a sparse bypass+parameter overlay) + footswitch/EXP assigns. Because **all scenes share one block list**, a Copy insert/remove must land in every scene, and the block lives in three keyed places (see `tmp-companion-write-safety`).
+- **Copy** (`src/views/copy/copyModel.ts` + `audiograph.rs`): a preset is a signal-path template + block list + per-block `(model_id, params, bypass, scene_edit_flag)` + scenes (a sparse bypass+parameter overlay) + footswitch/EXP assigns. Because **all scenes share one block list**, a Copy insert/remove must land in every scene, and the block lives in three keyed places (see `notes/gotchas.md`).
 - **Leveling** (`leveller.rs` / `audio.rs`): `presetLevel` is a **global multiplier** over all scenes → level the base scene first; each footswitch scene is leveled on its **active amp's `outputLevel`**. Block-acting footswitches level in ISOLATION: engage only that footswitch's on/off block(s), force every sibling footswitch's block OFF, and measure "Base" with ALL footswitches off (not as-saved) — otherwise sibling blocks bleed into the capture and inflate the reading. Reamp routes the DAW track into the chain's first block and bypasses the analog Loops 1–2, and the inject is not AGC'd — the model above is why.
 - **Signal chain + Catalog** (`SignalChainView` / `models/`): the 12 templates + block types + the cabinet sub-model are what the strip renders; `tmp-companion-catalog` owns the id→art/name mapping.
 
@@ -334,7 +334,7 @@ The firmware exposes the following screens / modals. Each is a _product surface_
 
 ## Sources
 
-- `Tone Master Pro` Interactive Owner's Manual — structural facts here verified against **firmware v1.8** (rev. J, 49 pp), read end to end as both text and rendered imagery; the model inventory below remains v1.7-pinned
+- `Tone Master Pro` Interactive Owner's Manual — structural facts here verified against **firmware v1.8** (rev. J, 49 pp), read end to end as both text and rendered imagery; the model inventory below remains v1.7-pinned (firmware 1.8 ships 31 new models the guide doesn't cover)
 - `Tone Master Pro` Model Guide (firmware v1.7, 127 pp)
 
-Re-fetch from Fender's product page when firmware revs (new models, MIDI-map changes, capacity-cap changes). Firmware 1.8 ships 31 new models, so this v1.7-pinned snapshot is one generation behind on the model inventory — the structural model above (templates, scenes, footswitch/EXP, constraints) is stable across 1.7→1.8.
+Re-fetch from Fender's product page when firmware revs (new models, MIDI-map changes, capacity-cap changes) — the structural model above (templates, scenes, footswitch/EXP, constraints) is stable across 1.7→1.8.
