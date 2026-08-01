@@ -12,6 +12,8 @@ TMP Companion is a macOS-only Tauri 2 app (Rust backend + React/TypeScript front
 
 Requires [Bun](https://bun.sh) ≥ 1.3 and a stable Rust toolchain.
 
+> **Also install Node.** Bun runs every script, but Vitest launches its worker under whatever `node` is on `PATH` and silently falls back to Bun when there is none. Under that fallback the jsdom suites become pathologically slow — `CatalogView.test.tsx` measured **1.7 s** for one case under Node and **over 120 s** (never finished) under Bun on the same machine. CI runners ship Node preinstalled, so this only bites locally, and it looks like a hang rather than a slow run.
+
 ```bash
 bun install
 bun run build          # produces dist/ — REQUIRED before any cargo check (tauri-build needs it)
@@ -23,6 +25,23 @@ cd src-tauri && cargo test --lib && cargo clippy --all-targets -- -D warnings &&
 ```
 
 CI (`.github/workflows/ci.yml`) runs all of the above plus the offline Playwright e2e and a leak-guard scan. A pre-commit hook runs lint-staged + the leak-guard locally.
+
+### Developing on Linux
+
+The app **ships** on macOS only — talking to a Tone Master Pro needs the IOKit HID transport, and re-amp needs CoreAudio. But the crate **builds and passes every non-device gate on Linux**, and CI runs those gates on both platforms. That is deliberate: everything above the `HidTransport` seam (`src-tauri/src/hid.rs`) is meant to stay portable, so a stray platform assumption elsewhere in the crate fails in CI rather than silently.
+
+What works on Linux: `cargo check`/`clippy`/`fmt`/`test --lib`, the whole frontend toolchain, and the offline Playwright e2e (it drives the real UI against the in-memory `SimDevice`, no hardware). What does not: connecting to a device — `hid::imp` is a stub off macOS and returns an error.
+
+System dependencies (Debian/Ubuntu):
+
+```bash
+sudo apt install libwebkit2gtk-4.1-dev libxdo-dev libayatana-appindicator3-dev \
+                 librsvg2-dev libasound2-dev
+```
+
+`libasound2-dev` is needed even though the re-amp paths are macOS-only: `cpal` is an unconditional dependency and must still compile.
+
+Then follow the build steps above. **Order matters** — `bun run build` must precede any `cargo` command, because `tauri-build`'s `generate_context!` panics when `dist/` is absent, and `dist/` is gitignored.
 
 ## Pull requests
 
