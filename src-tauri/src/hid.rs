@@ -676,6 +676,27 @@ mod imp {
             };
             return Err(format!("open {}: {err}{hint}", path.to_string_lossy()));
         }
+
+        // hidraw has no equivalent of IOKit's exclusive seize: two processes can open
+        // the same node and interleave reads and writes on it. Verified — two `probe`
+        // runs opened this device concurrently and both proceeded, where the second
+        // would have failed 0xe00002c5 on macOS. The rest of the codebase assumes that
+        // cannot happen (the write-safety rules in particular), so restore the
+        // invariant with an advisory whole-file lock: every path into the device goes
+        // through here, so our own processes mutually exclude. It is advisory, which is
+        // enough — Fender ships no Pro Control for Linux, so nothing else contends.
+        // The lock releases on close, including on abnormal exit.
+        if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } < 0 {
+            let err = IoError::last_os_error();
+            unsafe { libc::close(fd) };
+            if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                return Err(
+                    "the Tone Master Pro is already in use by another TMP Companion process (app or probe) — close it and retry"
+                        .into(),
+                );
+            }
+            return Err(format!("lock {}: {err}", path.to_string_lossy()));
+        }
         Ok(fd)
     }
 
