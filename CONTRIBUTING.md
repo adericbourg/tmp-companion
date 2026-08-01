@@ -1,6 +1,6 @@
 # Contributing
 
-TMP Companion is a macOS-only Tauri 2 app (Rust backend + React/TypeScript frontend) that talks to a Fender Tone Master Pro over USB. This file is the onramp; the depth lives elsewhere:
+TMP Companion is a macOS-first Tauri 2 app (Rust backend + React/TypeScript frontend) that talks to a Fender Tone Master Pro over USB. macOS is the platform it ships on; Linux builds, passes every gate, and talks to the device, minus the re-amp features — see [Developing on Linux](#developing-on-linux). This file is the onramp; the depth lives elsewhere:
 
 - **Before touching the device:** [`.claude/rules/danger.md`](.claude/rules/danger.md) — the always-loaded danger rules (data loss, device wedging, machine crashes).
 - **Start here:** [`CLAUDE.md`](CLAUDE.md) — the index to those rules, plus the traps that fire while running a command.
@@ -28,9 +28,11 @@ CI (`.github/workflows/ci.yml`) runs all of the above plus the offline Playwrigh
 
 ### Developing on Linux
 
-The app **ships** on macOS only — talking to a Tone Master Pro needs the IOKit HID transport, and re-amp needs CoreAudio. But the crate **builds and passes every non-device gate on Linux**, and CI runs those gates on both platforms. That is deliberate: everything above the `HidTransport` seam (`src-tauri/src/hid.rs`) is meant to stay portable, so a stray platform assumption elsewhere in the crate fails in CI rather than silently.
+The app **ships** on macOS. Linux is a supported _development_ platform and partially a working one: the crate builds and passes every gate there, and it talks to a real Tone Master Pro over `hidraw`.
 
-What works on Linux: `cargo check`/`clippy`/`fmt`/`test --lib`, the whole frontend toolchain, and the offline Playwright e2e (it drives the real UI against the in-memory `SimDevice`, no hardware). What does not: connecting to a device — `hid::imp` is a stub off macOS and returns an error.
+**Works on Linux:** every gate (`cargo check`/`clippy`/`fmt`/`test --lib`, the whole frontend toolchain, the offline Playwright e2e against `SimDevice`), and real device I/O — connect, preset list, the backup scan.
+
+**Does not work on Linux:** anything needing re-amp, i.e. the **Level and Doctor** tabs. Those capture audio through CoreAudio; the `cpal` code paths compile but `audio.rs` negotiates an `f32` stream, which ALSA does not offer for this class of device. Treat those two tabs as macOS-only for now.
 
 System dependencies (Debian/Ubuntu):
 
@@ -39,7 +41,16 @@ sudo apt install libwebkit2gtk-4.1-dev libxdo-dev libayatana-appindicator3-dev \
                  librsvg2-dev libasound2-dev
 ```
 
-`libasound2-dev` is needed even though the re-amp paths are macOS-only: `cpal` is an unconditional dependency and must still compile.
+`libasound2-dev` is needed even though re-amp does not work yet: `cpal` is an unconditional dependency and must still compile.
+
+**Device access.** `/dev/hidraw*` is root-only by default, so without a udev rule the app fails to open the unit with `EACCES`:
+
+```bash
+sudo cp packaging/udev/70-fender-tone-master-pro.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules && sudo udevadm trigger
+```
+
+`udevadm trigger` re-applies the rule to an already-connected unit, so no replug is needed. Verify with `ls /dev/hidraw*` and `getfacl /dev/hidrawN` — the rule grants the logged-in user access via an ACL, so you should see a `user:<you>:rw-` entry rather than a group change. Sanity-check the connection with `cargo run --bin probe`, which should print your preset list.
 
 Then follow the build steps above. **Order matters** — `bun run build` must precede any `cargo` command, because `tauri-build`'s `generate_context!` panics when `dist/` is absent, and `dist/` is gitignored.
 
