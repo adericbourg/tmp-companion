@@ -14,6 +14,13 @@ pub(crate) struct FootswitchLevelJob {
     pub(crate) lev_node_id: String,
     pub(crate) lev_parameter_id: String,
     pub(crate) target_lufs: f64,
+    /// The switch's CURRENT display label as the UI shows it (the Level list's footswitch row
+    /// name: the player's `customLabel`, else the toggled block's friendly name). Used ONLY
+    /// when the assign path appends a second function to a switch whose `customLabel` is empty
+    /// — the unit displays "MULTI" for a multi-function switch with no label, so writing the
+    /// prior display name keeps the pedalboard reading the same. Absent → today's behavior.
+    #[serde(default)]
+    pub(crate) display_label: Option<String>,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -34,10 +41,12 @@ pub(crate) fn cancel_footswitch_leveling() {
     crate::request_op_abort();
 }
 
-/// Read a slot's field-8 preset JSON on a fresh quiet session and return the parsed preset, the
-/// scene gate (`Some(empty)` = definitely no FS scenes; truncated/unknown or non-empty →
-/// conservative `true`), and the raw byte length. Shared by the footswitch leveling command +
-/// probes (the connect→drain→read→parse→scene-check boilerplate).
+/// Read a slot's field-8 preset JSON on a fresh quiet session and return the parsed preset, a
+/// DIAGNOSTIC "has FS scenes" flag (`Some(empty)` = definitely no FS scenes; truncated/unknown or
+/// non-empty → conservative `true`) and the raw byte length. Shared by the footswitch leveling
+/// command + probes (the connect→drain→read→parse→scene-check boilerplate). The flag is NO LONGER
+/// a gate: `footswitch::plan_footswitch_jobs` decides bake-vs-assign PER NODE off this same parsed
+/// document (`scene_jobs::scene_overlays_change_param`) — only `probe --fs-list` still prints it.
 pub(crate) fn read_slot_preset_parsed(
     slot: u32,
 ) -> Result<(serde_json::Value, bool, usize), String> {
@@ -150,11 +159,20 @@ pub(crate) fn resolve_footswitch_job(
             // all five fields identical across every assignment). Falls back to the
             // historical constants only when the switch has no existing function.
             let sibling = sw.first();
+            // A second function on an UNLABELLED switch makes the unit display "MULTI" instead
+            // of the single function's implied name. Nothing else changes the label: an already
+            // labelled switch keeps the player's own text (inherited), and the first function on
+            // an empty switch shows its own name, so there is nothing to preserve there.
+            let inherited = field_str(sibling, "customLabel");
+            let custom_label = match (inherited.is_empty(), sibling, &job.display_label) {
+                (true, Some(_), Some(shown)) => shown.clone(),
+                _ => inherited,
+            };
             leveller::FootswitchWriteSpec {
                 function_index: sw.len() as u32,
                 color_a: field_u64(sibling, "colorA", 3),
                 color_b: field_u64(sibling, "colorB", 0),
-                custom_label: field_str(sibling, "customLabel"),
+                custom_label,
                 link_group: field_u64(sibling, "linkGroup", 0),
                 is_active: false,
                 switch_type: field_u64(sibling, "switchType", 0),
@@ -195,16 +213,18 @@ pub(crate) async fn level_footswitches_apply<R: tauri::Runtime>(
     with_released_seize(state.session.clone(), move || {
         // Stream advisory live LUFS while each capture runs (dropped at closure end).
         let _lufs = LiveLufsGuard::install(app_evt);
-        // Read the preset once (resolve every job) + whether it has FS scenes (the bake gate).
-        let (preset, has_fs_scenes, _) = read_slot_preset_parsed(slot)?;
+        // THE single field-8 read: it resolves every job AND is the planner's scene-overlay
+        // source (per-node bake gate) — never add a second read here.
+        let (preset, _, _) = read_slot_preset_parsed(slot)?;
         std::thread::sleep(std::time::Duration::from_millis(leveller::RECONNECT_GAP_MS));
         let ftsw = preset
             .get("ftsw")
             .cloned()
             .unwrap_or(serde_json::Value::Null);
 
-        // Plan bake-vs-assign for the whole batch (pure) — block-off-in-base + sole-owner +
-        // no-scenes ⇒ bake straight onto the block; otherwise the (engaged-measured) param fn.
+        // Plan bake-vs-assign for the whole batch (pure) — block-off-in-base + sole-owner + no
+        // scene overlay on THAT node's bypass ⇒ bake straight onto the block (no `ftsw` write, so
+        // the switch keeps its single function and its label); otherwise the param assignment.
         let keys: Vec<footswitch::FsJobKey> = jobs
             .iter()
             .map(|j| footswitch::FsJobKey {
@@ -214,7 +234,7 @@ pub(crate) async fn level_footswitches_apply<R: tauri::Runtime>(
                 target_bits: j.target_lufs.to_bits(),
             })
             .collect();
-        let plans = footswitch::plan_footswitch_jobs(&ftsw, &preset, &keys, has_fs_scenes);
+        let plans = footswitch::plan_footswitch_jobs(&ftsw, &preset, &keys);
 
         // Load the preset ONCE for the whole batch — `measure_footswitch`'s caller
         // contract. Every job's sweep runs against this load (its pollution is
@@ -277,6 +297,7 @@ pub(crate) async fn level_footswitches_apply<R: tauri::Runtime>(
                 footswitch::FsLevelPlan::Bake {
                     engaged,
                     clear_stale,
+                    mirror_scenes,
                 } => leveller::measure_footswitch(
                     job.switch,
                     lev,
@@ -295,6 +316,7 @@ pub(crate) async fn level_footswitches_apply<R: tauri::Runtime>(
                                 lev: lev_owned(),
                                 write: leveller::FsWrite::Bake {
                                     clear_stale: *clear_stale,
+                                    mirror_scenes: mirror_scenes.clone(),
                                 },
                                 value: r.final_value,
                             },
@@ -384,7 +406,12 @@ pub(crate) async fn level_footswitches_apply<R: tauri::Runtime>(
         let write_result = if save && !pending.is_empty() {
             let (idxs, writes): (Vec<usize>, Vec<leveller::FsPendingWrite>) =
                 pending.into_iter().unzip();
-            leveller::write_footswitch_values(slot, &writes).map(|()| {
+            // Re-stamp the preset's original `lastLoadedScene`: the write session's base
+            // recall (and any bake-mirror scene recalls) leave the wrong scene active, and
+            // the save records the active one (HW: the FS save stamped 8 over scene 3).
+            let restore = crate::last_loaded_scene(&preset);
+            crate::warn_missing_restore_scene("level_footswitches", slot, &preset, restore);
+            leveller::write_footswitch_values(slot, &writes, restore).map(|()| {
                 let written: std::collections::HashSet<usize> = idxs.iter().copied().collect();
                 for &idx in &idxs {
                     if let Some(r) = &mut results[idx] {
@@ -443,6 +470,7 @@ mod tests {
             lev_node_id: "amp".into(),
             lev_parameter_id: "drive".into(),
             target_lufs: -20.0,
+            display_label: None,
         }
     }
 
@@ -501,6 +529,54 @@ mod tests {
         assert_eq!(spec.link_group, 0);
         assert_eq!(spec.switch_type, 0);
         assert!(!spec.is_active);
+    }
+
+    // BUG→GATE (the "MULTI" class): adding a SECOND function to a switch whose `customLabel`
+    // is empty makes the unit stop showing the single function's implied name and display
+    // "MULTI" instead. The UI's own row label rides along on the job, so write it as the
+    // switch's `customLabel` and the pedalboard display doesn't change.
+    #[test]
+    fn new_assignment_labels_an_unlabelled_switch_with_the_ui_display_label() {
+        let ftsw = serde_json::json!([[{ "func": "on-off", "customLabel": "" }]]);
+        let preset = preset_with_lev_param(0.5);
+        let job = FootswitchLevelJob {
+            display_label: Some("Mythic Drive".into()),
+            ..job()
+        };
+        let (_, spec) = resolve_footswitch_job(&ftsw, &preset, &job).expect("resolve");
+        assert_eq!(spec.function_index, 1, "a SECOND function is being added");
+        assert_eq!(
+            spec.custom_label, "Mythic Drive",
+            "the switch's prior display label is preserved as its customLabel"
+        );
+    }
+
+    // The player's own label is never touched — inheritance still wins.
+    #[test]
+    fn new_assignment_keeps_a_non_empty_sibling_label() {
+        let ftsw = serde_json::json!([[{ "func": "on-off", "customLabel": "BOOST" }]]);
+        let preset = preset_with_lev_param(0.5);
+        let job = FootswitchLevelJob {
+            display_label: Some("Mythic Drive".into()),
+            ..job()
+        };
+        let (_, spec) = resolve_footswitch_job(&ftsw, &preset, &job).expect("resolve");
+        assert_eq!(spec.custom_label, "BOOST");
+    }
+
+    // A switch with NO existing function gets a single function — the unit shows that
+    // function's own name, never "MULTI", so there is nothing to preserve.
+    #[test]
+    fn first_assignment_on_an_empty_switch_is_left_unlabelled() {
+        let ftsw = serde_json::json!([[]]);
+        let preset = preset_with_lev_param(0.5);
+        let job = FootswitchLevelJob {
+            display_label: Some("Mythic Drive".into()),
+            ..job()
+        };
+        let (_, spec) = resolve_footswitch_job(&ftsw, &preset, &job).expect("resolve");
+        assert_eq!(spec.function_index, 0);
+        assert_eq!(spec.custom_label, "");
     }
 
     // An EXISTING param assignment's isActive reads its own field verbatim — an

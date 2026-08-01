@@ -138,8 +138,9 @@ pub fn probe_bake_validate(
     let stim_path = std::env::var("TMP_LEVELLER_STIMULUS")
         .map_err(|_| "set TMP_LEVELLER_STIMULUS to the stimulus WAV".to_string())?;
     let stim = read_stimulus_calibrated(&stim_path, None)?;
-    // One read → the node's value, base bypass, switch fn count, and engaged force-list.
-    type Snap = (f64, bool, usize, Vec<(String, String, bool)>);
+    // One read → the node's value, base bypass, switch fn count, engaged force-list, and
+    // the saved `lastLoadedScene` (the commit's save must re-stamp it).
+    type Snap = (f64, bool, usize, Vec<(String, String, bool)>, Option<u32>);
     let snapshot = || -> Result<Snap, String> {
         let (p, _, _) = read_slot_preset_parsed(slot)?;
         let ftsw = p.get("ftsw").cloned().unwrap_or(serde_json::Value::Null);
@@ -149,15 +150,17 @@ pub fn probe_bake_validate(
             .and_then(|a| a.get(switch as usize)?.as_array().map(Vec::len))
             .unwrap_or(usize::MAX);
         let engaged = footswitch::engaged_bypass_for_switch(&ftsw, &p, switch);
+        let restore = crate::last_loaded_scene(&p);
         Ok((
             v,
             footswitch::block_bypassed_in_base(&p, node),
             fns,
             engaged,
+            restore,
         ))
     };
 
-    let (orig, byp0, fns0, engaged) = snapshot()?;
+    let (orig, byp0, fns0, engaged, restore) = snapshot()?;
     let mut out = format!(
         "[probe --bake-validate] slot {} · FS{switch} · {group}/{node}.{param}\n  before: value={orig:.4} bypass={byp0} switch_fns={fns0}\n",
         slot + 1
@@ -170,11 +173,16 @@ pub fn probe_bake_validate(
         switch,
         (group, node, param),
         &engaged,
-        &leveller::FsWrite::Bake { clear_stale: None },
+        &leveller::FsWrite::Bake {
+            clear_stale: None,
+            // Diagnostic arm: validate the raw base bake — no scene mirroring.
+            mirror_scenes: vec![],
+        },
         &stim,
         target_lufs,
         true,
         false,
+        restore,
     )?;
     out += &format!(
         "  baked: method={} value={:.4}{}\n",
@@ -184,7 +192,7 @@ pub fn probe_bake_validate(
     );
 
     // Verify field-8: the value landed, bypass unchanged, NO param fn added.
-    let (after, byp1, fns1, _) = snapshot()?;
+    let (after, byp1, fns1, _, _) = snapshot()?;
     let landed = (after - r.final_value as f64).abs() < 1e-3;
     out += &format!(
         "  after : value={after:.4} bypass={byp1} switch_fns={fns1}  ⇒  {}\n",
@@ -209,7 +217,7 @@ pub fn probe_bake_validate(
         s.save_current_preset(slot)?;
     }
     let _ = Session::connect().map(|mut s| s.set_reamp_mode(false));
-    let (restored, _, _, _) = snapshot()?;
+    let (restored, _, _, _, _) = snapshot()?;
     out += &format!(
         "  restore: value={restored:.4}  ⇒  {}\n",
         if (restored - orig).abs() < 1e-3 {
@@ -223,7 +231,10 @@ pub fn probe_bake_validate(
 
 /// Probe (read-only): list a slot's block-acting footswitches with each acted-on block's base
 /// bypass + the bake/assign classification for its first level param — to find bake-eligible
-/// presets (an active on-off enabling an OFF-in-base block).
+/// presets (an active on-off enabling an OFF-in-base block). `has_fs_scenes` is printed as a raw
+/// read DIAGNOSTIC only — the bake/assign gate is per-node (a scene overlay CHANGING that
+/// block's `bypass` OR its leveled param vs base), so a `has_fs_scenes=true` preset can
+/// still classify as Bake.
 pub fn probe_fs_list(slot: u32) -> Result<String, String> {
     let (preset, has_fs_scenes, json_len) = read_slot_preset_parsed(slot)?;
     let ftsw = preset
@@ -254,7 +265,6 @@ pub fn probe_fs_list(slot: u32) -> Result<String, String> {
                     lev_param: &lp.parameter_id,
                     target_bits: (-23.0f64).to_bits(),
                 }],
-                has_fs_scenes,
             );
             out += &format!(
                 "      → level {}.{}  ⇒  {:?}\n",
@@ -355,7 +365,7 @@ pub fn probe_level_footswitch(
         .and_then(|v| v.parse::<f32>().ok());
     let stim = read_stimulus_calibrated(&stim_path, cal)?;
 
-    let (preset, has_fs_scenes, _) = read_slot_preset_parsed(slot)?;
+    let (preset, _, _) = read_slot_preset_parsed(slot)?;
     std::thread::sleep(std::time::Duration::from_millis(leveller::RECONNECT_GAP_MS));
     let ftsw = preset
         .get("ftsw")
@@ -367,6 +377,8 @@ pub fn probe_level_footswitch(
         lev_node_id: lev_node.to_string(),
         lev_parameter_id: lev_param.to_string(),
         target_lufs,
+        // probe: no UI row label to preserve.
+        display_label: None,
     };
     let plan = footswitch::plan_footswitch_jobs(
         &ftsw,
@@ -377,7 +389,6 @@ pub fn probe_level_footswitch(
             lev_param,
             target_bits: target_lufs.to_bits(),
         }],
-        has_fs_scenes,
     )
     .into_iter()
     .next()
@@ -388,11 +399,16 @@ pub fn probe_level_footswitch(
         footswitch::FsLevelPlan::BakeShared { .. } => {
             return Err("single-job probe cannot be a shared bake".into())
         }
-        footswitch::FsLevelPlan::Bake { clear_stale, .. } => (
+        footswitch::FsLevelPlan::Bake {
+            clear_stale,
+            mirror_scenes,
+            ..
+        } => (
             leveller::FsWrite::Bake {
                 clear_stale: *clear_stale,
+                mirror_scenes: mirror_scenes.clone(),
             },
-            "BAKE → value written onto the block".to_string(),
+            format!("BAKE → value written onto the block (mirror scenes {mirror_scenes:?})"),
         ),
         footswitch::FsLevelPlan::Assign { .. } => {
             let (value_b, spec) = resolve_footswitch_job(&ftsw, &preset, &job)?;
@@ -408,6 +424,7 @@ pub fn probe_level_footswitch(
         | footswitch::FsLevelPlan::Assign { engaged } => engaged.clone(),
         _ => Vec::new(),
     };
+    let restore = crate::last_loaded_scene(&preset);
     let r = leveller::level_footswitch(
         slot,
         switch,
@@ -418,6 +435,7 @@ pub fn probe_level_footswitch(
         target_lufs,
         commit,
         true,
+        restore,
     )?;
     let mut out = format!(
         "[probe --level-footswitch] preset slot {} · FS{switch} · {lev_group}/{lev_node}.{lev_param}  ({})\n",
@@ -462,7 +480,7 @@ pub fn probe_level_footswitch(
 /// (`write_footswitch_values`). Verify persistence with `--export` afterwards.
 /// Point it at a SCRATCH preset: it persists.
 pub fn probe_fs_batch(list_index: u32, values: Vec<f32>) -> Result<String, String> {
-    let (preset, has_fs_scenes, _) = read_slot_preset_parsed(list_index)?;
+    let (preset, _, _) = read_slot_preset_parsed(list_index)?;
     let ftsw = preset
         .get("ftsw")
         .cloned()
@@ -487,6 +505,7 @@ pub fn probe_fs_batch(list_index: u32, values: Vec<f32>) -> Result<String, Strin
                 lev_node_id: p.node_id.clone(),
                 lev_parameter_id: p.parameter_id.clone(),
                 target_lufs: -24.0,
+                display_label: None,
             })
         })
         .collect();
@@ -499,7 +518,7 @@ pub fn probe_fs_batch(list_index: u32, values: Vec<f32>) -> Result<String, Strin
             target_bits: j.target_lufs.to_bits(),
         })
         .collect();
-    let plans = footswitch::plan_footswitch_jobs(&ftsw, &preset, &keys, has_fs_scenes);
+    let plans = footswitch::plan_footswitch_jobs(&ftsw, &preset, &keys);
 
     let mut pends: Vec<leveller::FsPendingWrite> = Vec::new();
     for (idx, (job, plan)) in jobs.iter().zip(&plans).enumerate() {
@@ -510,9 +529,13 @@ pub fn probe_fs_batch(list_index: u32, values: Vec<f32>) -> Result<String, Strin
             job.lev_parameter_id.clone(),
         );
         match plan {
-            footswitch::FsLevelPlan::Bake { clear_stale, .. } => {
+            footswitch::FsLevelPlan::Bake {
+                clear_stale,
+                mirror_scenes,
+                ..
+            } => {
                 out += &format!(
-                    "  FS{} {}/{}.{} → BAKE value {value}\n",
+                    "  FS{} {}/{}.{} → BAKE value {value} (mirror scenes {mirror_scenes:?})\n",
                     job.switch, lev.0, lev.1, lev.2
                 );
                 pends.push(leveller::FsPendingWrite {
@@ -520,6 +543,7 @@ pub fn probe_fs_batch(list_index: u32, values: Vec<f32>) -> Result<String, Strin
                     lev,
                     write: leveller::FsWrite::Bake {
                         clear_stale: *clear_stale,
+                        mirror_scenes: mirror_scenes.clone(),
                     },
                     value,
                 });
@@ -548,7 +572,8 @@ pub fn probe_fs_batch(list_index: u32, values: Vec<f32>) -> Result<String, Strin
             }
         }
     }
-    leveller::write_footswitch_values(list_index, &pends)?;
+    let restore = crate::last_loaded_scene(&preset);
+    leveller::write_footswitch_values(list_index, &pends, restore)?;
     out += &format!(
         "wrote {} switch(es) on ONE session + ONE save — export the slot to verify\n",
         pends.len()

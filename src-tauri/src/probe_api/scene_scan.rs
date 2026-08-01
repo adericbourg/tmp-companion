@@ -24,6 +24,7 @@ pub fn probe_level_scenes_oneshot(
     topology_id: String,
     scene_slots: Vec<u32>,
     rebalance: bool,
+    commit: bool,
 ) -> Result<String, String> {
     let scene_slots = if scene_slots.is_empty() {
         vec![session::BASE_SCENE_SLOT]
@@ -36,20 +37,48 @@ pub fn probe_level_scenes_oneshot(
         .and_then(|v| v.parse::<f32>().ok());
     let stim = read_stimulus_calibrated(&stim_path, cal)?;
     let candidates = load_and_filter_amp_candidates(list_index)?;
-    let (docs, _) = prepass_scene_docs(list_index, &scene_slots)?;
+    let (docs, restore_scene) = prepass_scene_docs(list_index, &scene_slots)?;
     std::thread::sleep(std::time::Duration::from_millis(leveller::RECONNECT_GAP_MS));
-    let jobs = build_scene_jobs(&scene_slots, &candidates, &docs, target_lufs, None)?;
-    // NO SAVE — restores the stored preset after measuring.
+    // THE field-8 read for this run: the routing-structure fallback AND the raw scene
+    // overlays `set_knobs` needs for its Scene Edit decision.
+    let saved = super::scene_jobs::read_saved_preset(list_index);
+    let jobs = build_scene_jobs(
+        &scene_slots,
+        &candidates,
+        &docs,
+        target_lufs,
+        saved.as_ref(),
+    )?;
+    // `commit` = repro instrumentation: run the REAL deferred-save path (the app's shape).
     let outcomes = if rebalance {
-        leveller::level_scenes_rebalance(list_index, &jobs, &stim, false, None, |_, _| {}, || false)
+        leveller::level_scenes_rebalance(
+            list_index,
+            &jobs,
+            &stim,
+            commit,
+            restore_scene.filter(|_| commit),
+            saved.as_ref(),
+            |_, _| {},
+            || false,
+        )
     } else {
-        leveller::level_scenes_oneshot(list_index, &jobs, &stim, false, None, |_, _| {}, || false)
+        leveller::level_scenes_oneshot(
+            list_index,
+            &jobs,
+            &stim,
+            commit,
+            restore_scene.filter(|_| commit),
+            saved.as_ref(),
+            |_, _| {},
+            || false,
+        )
     };
     // Guaranteed re-amp OFF regardless of outcome (a stranded re-amp mutes the input).
-    let _ = Session::connect().and_then(|mut s| s.set_reamp_mode(false).map(|_| ()));
+    leveller::reamp_off_guaranteed("scene-level");
     let outcomes = outcomes?;
     let mut out = format!(
-        "NO-SAVE leveling preset list_index={list_index} → target {target_lufs:.1} LUFS (topology {topology_id})\n"
+        "{} leveling preset list_index={list_index} → target {target_lufs:.1} LUFS (topology {topology_id})\n",
+        if commit { "COMMIT" } else { "NO-SAVE" },
     );
     for o in &outcomes {
         match &o.failure {
@@ -64,6 +93,113 @@ pub fn probe_level_scenes_oneshot(
                     if o.clamped { "  CLAMPED" } else { "" },
                 );
             }
+        }
+    }
+    Ok(out)
+}
+
+/// `probe --knob-sweep <listIdx> <group> <node> <param> <v1,v2,…>` — repro
+/// instrumentation: measure the captured loudness at each knob value on isolated fresh
+/// re-amp captures (the `measure_fs_at` recipe, no bypass forcing), in the preset's
+/// natural post-load state at its stored presetLevel. Working-copy writes are discarded
+/// by a final reload; ends with a guaranteed re-amp OFF. Stimulus via
+/// TMP_LEVELLER_STIMULUS (injected verbatim).
+pub fn probe_knob_sweep(
+    list_index: u32,
+    group: &str,
+    node: &str,
+    param: &str,
+    values: &[f32],
+) -> Result<String, String> {
+    let stim_path = std::env::var("TMP_LEVELLER_STIMULUS")
+        .map_err(|_| "set TMP_LEVELLER_STIMULUS to the stimulus WAV".to_string())?;
+    let stim = read_stimulus_calibrated(&stim_path, None)?;
+    {
+        let mut s = Session::connect_lean()?;
+        s.load_preset(list_index)?;
+        std::thread::sleep(std::time::Duration::from_millis(
+            leveller::settle_after_load_ms(),
+        ));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(leveller::RECONNECT_GAP_MS));
+    let mut out = format!("[probe --knob-sweep] list_index={list_index} {group}/{node}.{param}\n");
+    for v in values {
+        let l = leveller::measure_fs_at((group, node, param), &[], &stim, *v)?;
+        out += &format!(
+            "  {param}={v:.3} → integrated {:.3} LUFS  short-term-max {:.3}\n",
+            l.integrated_lufs, l.short_term_max_lufs
+        );
+        std::thread::sleep(std::time::Duration::from_millis(leveller::RECONNECT_GAP_MS));
+    }
+    // Discard the sweep pollution, then the guaranteed OFF.
+    if let Ok(mut s) = Session::connect_lean() {
+        let _ = s.load_preset(list_index);
+    }
+    leveller::reamp_off_guaranteed("knob-sweep");
+    Ok(out)
+}
+
+/// `probe --scene-doc <listIdx> <scene…>` — repro instrumentation: load the preset,
+/// then recall the given scenes IN ORDER on ONE held session, harvesting the device's
+/// RENDERED field-3 doc after each recall and printing the amp/vibe param values.
+/// Lets the caller control the arrival order, to catch rendered-vs-stored divergence
+/// (scene-materialization infidelity) deterministically. NON-DESTRUCTIVE: no writes.
+pub fn probe_scene_doc(list_index: u32, scenes: &[u32]) -> Result<String, String> {
+    const NODES: [(&str, &str); 2] = [("G1", "ACD_HiwattDR103CanMod"), ("G4", "ACD_UniVibe")];
+    fn fmt_doc(label: &str, doc: &serde_json::Value) -> String {
+        let mut out = format!(
+            "[{label}] lastLoadedScene={:?}\n",
+            doc.get("lastLoadedScene")
+        );
+        for (g, n) in NODES {
+            match crate::scenes::guitar_node(doc, g, n)
+                .and_then(|node| node.get("dspUnitParameters"))
+                .and_then(|p| p.as_object())
+            {
+                Some(params) => {
+                    let mut kv: Vec<String> = params
+                        .iter()
+                        .filter_map(|(k, v)| v.as_f64().map(|f| format!("{k}={f:.4}")))
+                        .collect();
+                    kv.sort();
+                    out += &format!("  {g}/{n}: {}\n", kv.join(" "));
+                }
+                None => out += &format!("  {g}/{n}: <absent/truncated>\n"),
+            }
+        }
+        out
+    }
+    let mut s = Session::connect()?;
+    for _ in 0..8 {
+        s.heartbeat()?;
+        s.pump_collect(120)?;
+    }
+    s.raw.clear();
+    s.send_and_collect(&proto::load_preset((list_index + 1) as u64, 1), 300)?;
+    for _ in 0..6 {
+        s.heartbeat()?;
+        s.pump_collect(200)?;
+    }
+    let mut out = format!("[probe --scene-doc] list_index={list_index}\n");
+    match s.current_preset_value() {
+        Ok(d) => out += &fmt_doc("post-load", &d),
+        Err(e) => out += &format!("[post-load] no doc: {e}\n"),
+    }
+    for &sc in scenes {
+        s.raw.clear();
+        s.send_and_collect(&proto::load_scene(sc as u64), 300)?;
+        let mut doc = None;
+        for _ in 0..4 {
+            s.heartbeat()?;
+            s.pump_collect(150)?;
+            if let Ok(v) = s.current_preset_value() {
+                doc = Some(v);
+                break;
+            }
+        }
+        match doc {
+            Some(d) => out += &fmt_doc(&format!("recall scene {sc}"), &d),
+            None => out += &format!("[recall scene {sc}] NO DOC harvested\n"),
         }
     }
     Ok(out)

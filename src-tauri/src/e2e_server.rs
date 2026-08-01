@@ -122,7 +122,8 @@ pub fn run_e2e_server() {
             e2e_clear_strays,
             e2e_clear_preset,
             e2e_load_preset,
-            e2e_reamp_off
+            e2e_reamp_off,
+            e2e_measure_sound
         ])
         .build(tauri::test::mock_context(tauri::test::noop_assets()))
         .expect("build e2e mock app");
@@ -167,7 +168,7 @@ fn e2e_install_offline_fake() {
     let sim = crate::sim_device::SimDevice::new();
     crate::sim_device::set_live(&sim); // expose its event log to /sim/events
     crate::session::e2e_transport::set_factory(Box::new(move || Box::new(sim.clone())));
-    // The 4 scenario presets at slots 400-403 — same slots the online tier seeds by
+    // The 5 scenario presets at slots 400-404 — same slots the online tier seeds by
     // cloning, and the same presets baked into the backup fixture, so one set of specs
     // runs in both modes. `ensureScenario` finds them present offline and skips seeding.
     let presets = vec![
@@ -186,6 +187,10 @@ fn e2e_install_offline_fake() {
         session::PresetEntry {
             slot: 403,
             name: "E2E Realistic".into(),
+        },
+        session::PresetEntry {
+            slot: 404,
+            name: "E2E Hiwatt 3S".into(),
         },
     ];
     MONITOR_ENABLED.store(true, SeqCst);
@@ -301,10 +306,10 @@ fn e2e_patch_snapshot_slot(slot: u32, name: &str) -> bool {
     true
 }
 
-/// ONLINE-e2e DETERMINISTIC scratch setup: sweep stray imports, then place the THREE
-/// committed scenario presets (`e2e/fixtures/scenario-presets.json` — the SAME
-/// presetJsons baked into the offline backup fixture) at their list indices
-/// (400/401/402). The heavy lifting lives in `probe_api::seed_scenario` — shared with
+/// ONLINE-e2e DETERMINISTIC scratch setup: sweep stray imports, then place EVERY
+/// committed scenario preset (`e2e/fixtures/scenario-presets.json` — the SAME
+/// presetJsons baked into the offline backup fixture) at its list index
+/// (400-404; the spec drives the slot set, nothing here hardcodes it). The heavy lifting lives in `probe_api::seed_scenario` — shared with
 /// `probe --seed-scenario`, which the RUNNER prefers (a fresh process per seed, run
 /// before the server starts, dodges the in-process `0xe00002c5` open lockout that
 /// aborted in-spec seeds). This command is the fallback for specs run without the
@@ -319,7 +324,9 @@ async fn e2e_seed_scenario(state: State<'_, AppState>) -> Result<(), String> {
         return e2e_mark_seeded_snapshot();
     }
     with_released_seize(state.session.clone(), move || {
-        let o = probe_api::seed_scenario::seed_scenario_core()?;
+        // Pristine self-repair is ONLINE-only (see `seed_scenario_core`): offline the
+        // suite's own leveling drifts the sim's slots by design.
+        let o = probe_api::seed_scenario::seed_scenario_core(e2e_online())?;
         e2e_patch_swept(&o.swept);
         e2e_mark_seeded_snapshot()?;
         SCENARIO_VERIFIED.store(true, Ordering::SeqCst);
@@ -487,6 +494,73 @@ async fn e2e_reamp_off(state: State<'_, AppState>) -> Result<(), String> {
     }
     with_released_seize(state.session.clone(), move || {
         Session::connect()?.set_reamp_mode(false).map(|_| ())
+    })
+    .await
+}
+
+/// STRICT-HARNESS measure for the online post-leveling audio gate
+/// (`level-strict.spec.ts`): re-measure one sound of `slot` exactly as the leveling
+/// lane measured it (scene as-is / base isolation / footswitch engaged state with
+/// the saved ASSIGN `valueA` re-played) and return its integrated LUFS, so the spec
+/// can assert the SAVED preset actually renders at the leveling target. ONLINE-only:
+/// the offline fake has no audio path (its capture is a stimulus passthrough — every
+/// sound would "measure" identically, a vacuous gate).
+/// The leveled-param coordinates a footswitch re-measure replays (see
+/// `e2e_measure_sound` — the SPEC owns these, mirroring what it fed the leveling
+/// lane, so no server-side picker exists to diverge from the wizard's choice).
+#[cfg(feature = "e2e")]
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FsLevRef {
+    group_id: String,
+    node_id: String,
+    parameter_id: String,
+}
+
+#[cfg(feature = "e2e")]
+#[tauri::command]
+async fn e2e_measure_sound(
+    app: tauri::AppHandle<tauri::test::MockRuntime>,
+    state: State<'_, AppState>,
+    slot: u32,
+    scene: Option<u32>,
+    footswitch: Option<u32>,
+    topology_id: String,
+    lev: Option<FsLevRef>,
+) -> Result<f64, String> {
+    if !e2e_online() {
+        return Err("e2e_measure_sound is online-only (the offline fake has no audio path)".into());
+    }
+    let stim_path = resolve_stimulus(&app, None, Some(topology_id))?;
+    with_released_seize(state.session.clone(), move || {
+        let stim = read_stimulus_calibrated(&stim_path, None)?;
+        if scene.is_some() {
+            return leveller::measure_sound_asis_strict(slot, scene, &[], None, &stim)
+                .map(|l| l.integrated_lufs);
+        }
+        // Base / footswitch context: the ONE shared isolation derivation the leveling +
+        // Doctor lanes use (`doctor_force_bypass` over the SAVED doc) — not a private copy.
+        let saved = read_saved_preset(slot)
+            .ok_or_else(|| format!("field-8 read failed for slot {slot}"))?;
+        let force =
+            crate::commands::doctor::doctor_force_bypass(&saved["ftsw"], &saved, footswitch);
+        // An ASSIGN switch's engaged sound = the leveled param at its saved `valueA`; a
+        // BAKED (or assignment-less) switch needs no write. The leveled param TRIPLE comes
+        // from the CALLER — the spec owns the same pinned coordinates it fed the leveling
+        // lane — so there is no second in-server param picker to diverge from the wizard's
+        // `defaultParamIndex` choice.
+        let fs_value = match (footswitch, lev) {
+            (Some(sw), Some(l)) => footswitch::existing_param_fn_value_a(
+                &saved["ftsw"],
+                sw,
+                &l.node_id,
+                &l.parameter_id,
+            )
+            .map(|v| ((l.group_id, l.node_id, l.parameter_id), v as f32)),
+            _ => None,
+        };
+        leveller::measure_sound_asis_strict(slot, None, &force, fs_value, &stim)
+            .map(|l| l.integrated_lufs)
     })
     .await
 }

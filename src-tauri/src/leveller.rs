@@ -26,7 +26,7 @@ use serde::Serialize;
 use crate::audio;
 use crate::lufs;
 use crate::session::Session;
-use crate::{sleep_abortable, sleep_or_cancel};
+use crate::{read_saved_preset, scene_overlay, sleep_abortable, sleep_or_cancel, SceneOverlay};
 
 // Post-load DSP settle before a capture. Was a conservative 1200; HW-bisected to 400
 // on fw 1.8.45 (dry slot 11 + wet delay slot 5): measured C, presetLevel, and verify
@@ -126,25 +126,23 @@ pub fn doctor_signal_start(onset: usize, confident: bool) -> usize {
 /// since `washed` is inapplicable by construction; the R4/R5 hardware sweeps
 /// re-baseline the OTHER thresholds against this shorter recipe.
 pub const DOCTOR_TAIL_DRY_MS: u32 = 300;
-// Scene mode (`SetNodeSceneEdit`) MUST be enabled before the value write, or the
-// write hits the BASE/global value and leaks across scenes (HW). But the settle must
-// stay SHORT: the device accepts the scene write only within ~700–750 ms of the
-// `loadScene` recall (HW-bisected, `probe --bisect-scene` on fw 1.8.45 —
-// load_scene→300→edit→400→write lands; …→450→write is SILENTLY DROPPED, no
-// presetError, nothing persists). The old "generous" 600 ms put every production
-// scene write past that cliff — 100% dropped — which surfaced as false "clamped at
-// (as-is)" rows and zero persistence while every 300 ms probe path worked. The rare
-// leak-to-base race a longer settle targeted is covered by the verify + correction
-// pass instead. Keep load_scene→edit→write gaps ≤300 ms.
+// The device silently DROPS a scene-context write when the session sat IDLE too long
+// immediately before it — a PER-COMMAND idle-gap cliff at ~400–450 ms, NOT a
+// "time since loadScene" window (the earlier reading of the same bisect data). The
+// discriminating HW run (Hiwatt slot 31, fw 1.8.45): the enable-dropped branch's
+// back-to-back 150+300 ms sleeps formed ONE 450 ms idle gap and 6/6 bare scene
+// writes vanished (no presetError, nothing in the working copy, nothing persisted)
+// even though only ~450 ms had passed since `loadScene` — while the bisect's
+// load_scene→300→edit→400→write (max single gap 400 ms) lands and …→450→write
+// drops. Same cliff family as the idle re-amp-OFF drop (`reamp_off_guaranteed`).
+// So: keep EVERY pre-write idle gap ≤~300 ms, and never sleep a settle for a
+// command that wasn't sent (the conditional in `set_knobs`).
 const SETTLE_AFTER_SCENE_EDIT_MS: u64 = 300;
-// Gap between the `loadScene` recall and `SetNodeSceneEdit` in a scene write. 150 (not
-// the general 300 `SETTLE_AFTER_SET_MS`) CENTERS the value write ~450 ms after
-// `loadScene` — the old 300+300 put it at ~600–650 ms nominal, riding the ~700–750 ms
-// silent-drop cliff above, so command-latency jitter occasionally pushed a production
-// write over it (the user-reported non-deterministic false clamp; the write itself is
-// fire-and-forget, so nothing surfaced). HW-bisected lower edge (`probe
-// --bisect-scene`, fw 1.8.45): scene_settle 150, 100, and even 50 all land ON the
-// scene overlay (never leak to base) and persist — 150 keeps ~2× margin on both sides.
+// Gap between the `loadScene` recall and the next command (`SetNodeSceneEdit`, or the
+// value write itself when the enable is dropped). 150 (not the general 300
+// `SETTLE_AFTER_SET_MS`) keeps the gap far under the ~400–450 ms idle cliff above.
+// HW-bisected lower edge (`probe --bisect-scene`, fw 1.8.45): scene_settle 150, 100,
+// and even 50 all land ON the scene overlay (never leak to base) and persist.
 pub(crate) const SETTLE_AFTER_SCENE_RECALL_MS: u64 = 150;
 const RATE: u32 = 48_000;
 const LEVEL_MIN: f32 = 0.0;
@@ -197,6 +195,12 @@ pub struct LevelResult {
     /// never a re-measurement. Only the one-shot `presetLevel` path (`level_preset`)
     /// sets this; `None` for scene/block/footswitch paths this cycle.
     pub true_peak_dbtp: Option<f64>,
+    /// Post-save param-level verify, forwarded from the batched scene runner's
+    /// [`BatchedSceneOutcome::persist_mismatch`]: `Some(true)` = the saved preset does
+    /// NOT hold the value this result reports (do not trust the number); `Some(false)`
+    /// = re-read and confirmed; `None` = not checked (no save, nothing written, the
+    /// re-read failed, or a path without the verify).
+    pub persist_mismatch: Option<bool>,
 }
 
 #[derive(Clone, Copy)]
@@ -213,6 +217,14 @@ pub struct LevelOptions {
     /// `saveCurrentPreset` persists every accumulated overlay (HW,
     /// `probe --defer-scenes`). Meaningless with `save: true`.
     pub defer: bool,
+    /// Scene to recall right before a `save: true` save, so the save re-stamps the
+    /// preset's ORIGINAL `lastLoadedScene` (0-based scene index, or
+    /// `session::BASE_SCENE_SLOT`). The base-context measurement recalls base (issue:
+    /// base must measure base, not the saved scene), which leaves base active at save
+    /// time — without this the save silently rewrites `lastLoadedScene` to 8 (HW,
+    /// Hiwatt slot 31: pre 3 → post 8), changing which scene the preset loads into on
+    /// the pedalboard. `None` = save whatever context is active (old behavior).
+    pub restore_scene: Option<u32>,
 }
 
 impl Default for LevelOptions {
@@ -222,19 +234,21 @@ impl Default for LevelOptions {
             verify: false,
             ref_level: 0.5,
             defer: false,
+            restore_scene: None,
         }
     }
 }
 
-/// Fresh-connect, set `level` (NO load — the current preset is already the one
-/// we want), engage re-amp once, capture, and return the loudest channel's
-/// loudness. The one-shot `presetLevel` case of `measure_knob_at`.
+/// Fresh-connect, recall BASE, set `level` (NO preset load — the current preset is already
+/// the one we want), engage re-amp once, capture, and return the loudest channel's loudness.
+/// The one-shot `presetLevel` case of `measure_knob_at` (which owns the base recall — see
+/// `arm_measurement`: without it the capture measures the preset's saved `lastLoadedScene`).
 fn measure_at_level(
     stimulus: &[f32],
     level: f32,
     force_bypass: &[(String, String, bool)],
 ) -> Result<lufs::Loudness, String> {
-    measure_knob_at(stimulus, &LevelKnob::PresetLevel, level, force_bypass)
+    measure_knob_at(stimulus, &LevelKnob::PresetLevel, level, force_bypass, None)
 }
 
 /// Sentinel error returned when a cooperative cancel flag is observed at a leveling
@@ -320,6 +334,24 @@ pub(crate) fn floor_suspect(capture_spread_lu: f64, stimulus_spread_lu: f64) -> 
     stimulus_spread_lu > STATIONARY_STIM_LU && capture_spread_lu <= FLOOR_TRIP_LU
 }
 
+/// Slack over the stimulus spread before a capture counts as aberrant. A driven chain
+/// only ever COMPRESSES dynamics, so out-spread ≤ in-spread is the physical bound and
+/// this margin covers metering noise around it (the two spreads are measured on
+/// different buffers by different meter runs), not any real excess.
+pub(crate) const SPREAD_ABERRANT_MARGIN_LU: f64 = 0.3;
+
+/// Is this capture MORE dynamic than the stimulus that drove it? Physically impossible
+/// for a genuinely driven amp state (a chain compresses, it does not expand), so it is
+/// the tell for a fire-and-forget preset/scene recall that only PARTIALLY landed — the
+/// capture then reads plausible but belongs to a sound we did not ask for. Armed by the
+/// same stationary-stimulus gate as [`floor_suspect`]: a stimulus with no dynamics of
+/// its own (or an unmeasurable one, which reports 0.0) can't discriminate, so it
+/// disarms both checks rather than trip this one on every capture.
+pub(crate) fn spread_aberrant(capture_spread_lu: f64, stimulus_spread_lu: f64) -> bool {
+    stimulus_spread_lu > STATIONARY_STIM_LU
+        && capture_spread_lu > stimulus_spread_lu + SPREAD_ABERRANT_MARGIN_LU
+}
+
 /// Did the capture track a `presetLevel` shift by 20·log10 (real signal), or stay
 /// put (floor)?
 pub(crate) fn tracks_level_shift(
@@ -350,29 +382,51 @@ pub(crate) enum GuardOutcome {
     StillFlat(lufs::Loudness),
 }
 
-/// Run `measure`; if the capture is floor-suspect, wait `gap` and retry ONCE with the
-/// same settings (heals a transient inject failure). A persistently flat capture is
-/// reported, not swallowed. The measurement's own spread stays advisory elsewhere.
+/// Run `measure`; if the capture is aberrant, wait `gap` and retry ONCE with the same
+/// settings (heals a transient inject failure or a half-landed recall). TWO tells, one
+/// retry budget between them:
+///
+/// * FLOOR ([`floor_suspect`]) — no dynamics at all. A persistently flat capture is
+///   reported as [`GuardOutcome::StillFlat`], not swallowed; callers escalate.
+/// * SPREAD ([`spread_aberrant`]) — MORE dynamics out than in. Always resolves to
+///   `Live`: the reading is plausible (just possibly of the wrong sound), so erroring a
+///   row on this heuristic would be the worse failure. It must NOT resolve to
+///   `StillFlat` either — `measure_c`'s level-shift confirm would PASS a wrong-scene
+///   capture (`presetLevel` is a linear post-chain multiplier whatever scene landed)
+///   and launder it as verified.
 pub(crate) fn measure_floor_guarded(
     mut measure: impl FnMut() -> Result<lufs::Loudness, String>,
     stimulus_spread_lu: f64,
     gap: Duration,
 ) -> Result<GuardOutcome, String> {
     let first = measure()?;
-    if !floor_suspect(first.spread_lu(), stimulus_spread_lu) {
+    if floor_suspect(first.spread_lu(), stimulus_spread_lu) {
+        log::warn!(
+            "floor guard: capture spread {:.2} LU ≤ {FLOOR_TRIP_LU} — suspected silent inject, retrying once",
+            first.spread_lu()
+        );
+    } else if spread_aberrant(first.spread_lu(), stimulus_spread_lu) {
+        log::warn!(
+            "floor guard: capture spread {:.2} LU exceeds the stimulus's {stimulus_spread_lu:.2} LU \
+             — a chain cannot expand dynamics, so the recall likely half-landed; retrying once",
+            first.spread_lu()
+        );
+    } else {
         return Ok(GuardOutcome::Live(first));
     }
-    log::warn!(
-        "floor guard: capture spread {:.2} LU ≤ {FLOOR_TRIP_LU} — suspected silent inject, retrying once",
-        first.spread_lu()
-    );
     sleep_or_cancel(gap.as_millis() as u64)?;
     let second = measure()?;
     if floor_suspect(second.spread_lu(), stimulus_spread_lu) {
-        Ok(GuardOutcome::StillFlat(second))
-    } else {
-        Ok(GuardOutcome::Live(second))
+        return Ok(GuardOutcome::StillFlat(second));
     }
+    if spread_aberrant(second.spread_lu(), stimulus_spread_lu) {
+        log::warn!(
+            "floor guard: capture spread {:.2} LU still exceeds the stimulus's \
+             {stimulus_spread_lu:.2} LU after the retry — reporting it, verify this sound by ear",
+            second.spread_lu()
+        );
+    }
+    Ok(GuardOutcome::Live(second))
 }
 
 /// The common call-site shape: guard `measure`, collapse a persistent flat read to
@@ -424,7 +478,9 @@ pub struct MeasuredC {
 /// Conn 1+2 seam: load `slot` (own connection, since set-after-load is overridden
 /// in-connection), then measure its captured loudness at `ref_level` on a fresh
 /// connection, and solve `C` in `LUFS = 20·log10(level) + C`. `C` is the preset's
-/// max reachable captured loudness.
+/// max reachable captured loudness — of its BASE sound: every capture here recalls base
+/// first (`arm_measurement`), since a load activates the preset's saved `lastLoadedScene`
+/// and an unrecalled capture would solve `C` for that scene instead.
 pub fn measure_c(
     slot: u32,
     stimulus: &[f32],
@@ -565,16 +621,17 @@ pub(crate) fn capture_on_session(
     ref_level: Option<f32>,
     tail_ms: u64,
 ) -> Result<audio::Capture, String> {
-    // Force-bypass isolation AFTER any scene recall, BEFORE the presetLevel set +
-    // engage (the `measure_knob_at` ordering): a scene load would re-assert the
-    // scene's own bypass state, so isolation must land after it.
+    // Force-bypass isolation AFTER the caller's scene recall (`arm_measurement`'s rule: a
+    // recall re-asserts that scene's own bypass state, so isolation written before it is
+    // reverted) and before the engage. The presetLevel set below is a global multiplier, not
+    // a scene-scoped write, so it can't revert these either way.
     for (g, n, byp) in force_bypass {
         s.change_parameter_bool(g, n, "bypass", *byp)?;
     }
     // `None` = capture at the preset's OWN stored level (Doctor's apply A/B),
     // leaving the edit buffer's presetLevel untouched.
     if let Some(ref_level) = ref_level {
-        set_knob(s, &LevelKnob::PresetLevel, ref_level.clamp(0.05, 1.0))?;
+        set_knob(s, &LevelKnob::PresetLevel, ref_level.clamp(0.05, 1.0), None)?;
         sleep_or_cancel(SETTLE_AFTER_SET_MS)?;
     }
     let _ = s.set_reamp_mode(true)?;
@@ -618,7 +675,18 @@ pub fn capture_loudness_asis(
     scene: Option<u32>,
     stimulus: &[f32],
 ) -> Result<lufs::Loudness, String> {
-    let cap = capture_full_at(
+    loudest_loudness(capture_asis_full(slot, scene, stimulus))
+}
+
+/// Repro instrumentation: the FULL multi-channel as-is capture behind
+/// [`capture_loudness_asis`], so a probe can report EVERY channel's loudness and
+/// make the loudest-channel argmax observable instead of inferred.
+pub fn capture_asis_full(
+    slot: Option<u32>,
+    scene: Option<u32>,
+    stimulus: &[f32],
+) -> Result<audio::Capture, String> {
+    capture_full_at(
         slot.unwrap_or(0), // unused when skip_load
         scene,
         &[],
@@ -626,8 +694,7 @@ pub fn capture_loudness_asis(
         None,
         CAPTURE_TAIL_MS,
         slot.is_none(),
-    );
-    loudest_loudness(cap)
+    )
 }
 
 /// MEASURE seam for analysis (spectrum / audit): load `slot`, re-amp the
@@ -779,6 +846,55 @@ pub fn doctor_capture_on_session(
     )?))
 }
 
+/// STRICT-HARNESS measure (the online e2e's post-leveling audio gate,
+/// `level-strict.spec.ts`): re-measure one leveled sound of `slot` AS-IS on the
+/// production capture path and the LEVELING metric (loudest channel,
+/// floor-guarded), so the spec can assert the SAVED state actually renders at the
+/// leveling target — not merely that the run reported success. Context mirrors
+/// the leveling lanes exactly:
+/// * scene sound — pure as-is (`loadScene` applies the scene's own `ftswStates`);
+///   `force_bypass` empty;
+/// * base sound — fresh load + base recall + the base isolation (every
+///   block-acting switch's block forced off) in `force_bypass`;
+/// * footswitch sound — fresh load + base recall + siblings-off + own engaged
+///   flip in `force_bypass`, plus `fs_value` re-playing an ASSIGN switch's saved
+///   `valueA` onto the leveled param (a BAKED switch needs no write — its engaged
+///   sound IS the base value).
+pub fn measure_sound_asis_strict(
+    slot: u32,
+    scene: Option<u32>,
+    force_bypass: &[(String, String, bool)],
+    fs_value: Option<((String, String, String), f32)>,
+    stimulus: &[f32],
+) -> Result<lufs::Loudness, String> {
+    if let Some(((g, n, p), v)) = fs_value {
+        {
+            let mut s = Session::connect_lean()?;
+            s.load_preset(slot)?;
+            std::thread::sleep(Duration::from_millis(settle_after_load_ms()));
+        }
+        std::thread::sleep(Duration::from_millis(RECONNECT_GAP_MS));
+        return require_live(
+            || measure_fs_at((&g, &n, &p), force_bypass, stimulus, v),
+            stimulus,
+        );
+    }
+    require_live(
+        || {
+            loudest_loudness(capture_full_at(
+                slot,
+                scene,
+                force_bypass,
+                stimulus,
+                None,
+                CAPTURE_TAIL_MS,
+                false,
+            ))
+        },
+        stimulus,
+    )
+}
+
 /// MEASURE seam for scene leveling: load `slot`, then for each scene in
 /// `0..scene_count` activate it (`loadScene`) and capture its ceiling loudness at
 /// `presetLevel = 1.0`. Returns per-scene loudness (LUFS) — feed to
@@ -807,7 +923,7 @@ pub fn capture_scene_ceilings(
         let mut s = Session::connect_lean()?;
         s.load_scene(scene)?;
         std::thread::sleep(Duration::from_millis(SETTLE_AFTER_SET_MS));
-        set_knob(&mut s, &LevelKnob::PresetLevel, 1.0)?;
+        set_knob(&mut s, &LevelKnob::PresetLevel, 1.0, None)?;
         std::thread::sleep(Duration::from_millis(SETTLE_AFTER_SET_MS));
         cs.push(engage_measure_disengage(&mut s, stimulus)?.integrated_lufs);
     }
@@ -914,7 +1030,14 @@ pub fn apply_level(
     opts: LevelOptions,
     reload_preset: bool,
 ) -> Result<(bool, Option<f64>), String> {
-    apply_levels(slot, stimulus, &[(knob, final_level)], opts, reload_preset)
+    apply_levels(
+        slot,
+        stimulus,
+        &[(knob, final_level)],
+        opts,
+        reload_preset,
+        None,
+    )
 }
 
 /// Multi-knob Conn-3 seam: set every `(knob, value)` in `targets` (all belonging to
@@ -928,6 +1051,7 @@ pub fn apply_levels(
     targets: &[(&LevelKnob, f32)],
     opts: LevelOptions,
     reload_preset: bool,
+    saved: Option<&serde_json::Value>,
 ) -> Result<(bool, Option<f64>), String> {
     if reload_preset {
         let mut s = Session::connect()?;
@@ -944,7 +1068,7 @@ pub fn apply_levels(
 
     let mut verify_lufs = None;
     let mut s = Session::connect()?;
-    set_knobs(&mut s, targets)?; // set before any re-amp engage (latched)
+    set_knobs(&mut s, targets, saved)?; // set before any re-amp engage (latched)
     std::thread::sleep(Duration::from_millis(SETTLE_AFTER_SET_MS));
 
     if opts.verify {
@@ -962,11 +1086,20 @@ pub fn apply_levels(
             .iter()
             .all(|(k, _)| matches!(k, LevelKnob::PresetLevel))
         {
-            let _ = set_knobs(&mut s, targets);
+            let _ = set_knobs(&mut s, targets, saved);
             std::thread::sleep(Duration::from_millis(150));
         }
     }
 
+    // Any unsaved `presetLevel` must ride through the pre-save recall via
+    // `recall_reassert_save` (see its doc for the load-level-apply clobber this
+    // guards). The re-assert value is the PresetLevel target when one is in the
+    // batch; Block-knob targets need none (overlay writes persist through the
+    // recall — the footswitch `switch_at_target` re-run spec proves it).
+    let reassert_pl = targets
+        .iter()
+        .find(|(k, _)| matches!(k, LevelKnob::PresetLevel))
+        .map(|(_, v)| *v);
     if opts.save {
         if opts.verify {
             // A session that has toggled re-amp silently DROPS the save (HW: after the
@@ -976,9 +1109,10 @@ pub fn apply_levels(
             // reconnects, so save on a FRESH connection.
             drop(s);
             std::thread::sleep(Duration::from_millis(RECONNECT_GAP_MS));
-            Session::connect()?.save_current_preset(slot)?;
+            let mut s2 = Session::connect()?;
+            recall_reassert_save(&mut s2, slot, opts.restore_scene, reassert_pl)?;
         } else {
-            s.save_current_preset(slot)?;
+            recall_reassert_save(&mut s, slot, opts.restore_scene, reassert_pl)?;
         }
     } else if opts.defer {
         // Deferred mode: leave the write UNSAVED in the working copy — the scene
@@ -1064,6 +1198,20 @@ pub fn restore_redistribution(
     knobs: &[PrevKnobWrite],
     expected_name: &str,
 ) -> Result<(), String> {
+    // The saved doc `set_knobs` needs for a per-scene restore write, read before the
+    // name-guard session (`read_saved_preset` sleeps after itself).
+    let saved = saved_for_scene_knobs(
+        slot,
+        &knobs
+            .iter()
+            .map(|k| LevelKnob::Block {
+                group_id: k.group_id.clone(),
+                node_id: k.node_id.clone(),
+                parameter_id: "outputLevel".to_string(),
+                scene_slot: k.scene_slot,
+            })
+            .collect::<Vec<_>>(),
+    );
     {
         let mut s = Session::connect()?;
         let list = s.list_my_presets()?;
@@ -1079,7 +1227,7 @@ pub fn restore_redistribution(
     }
     s.set_preset_level(preset_level)?;
     std::thread::sleep(Duration::from_millis(SETTLE_AFTER_SET_MS));
-    write_grouped_knobs(&mut s, knobs)?;
+    write_grouped_knobs(&mut s, knobs, saved.as_ref())?;
     recall_base(&mut s)?;
     s.save_current_preset(slot)
 }
@@ -1091,7 +1239,11 @@ pub fn restore_redistribution(
 /// `list_my_presets`' "My Presets" echo, which the fake doesn't model). See
 /// `restore_redistribution`'s doc for why grouping (not one `set_knob` call per
 /// knob) matters.
-fn write_grouped_knobs(s: &mut Session, knobs: &[PrevKnobWrite]) -> Result<(), String> {
+fn write_grouped_knobs(
+    s: &mut Session,
+    knobs: &[PrevKnobWrite],
+    saved: Option<&serde_json::Value>,
+) -> Result<(), String> {
     let level_knobs: Vec<LevelKnob> = knobs
         .iter()
         .map(|k| LevelKnob::Block {
@@ -1114,7 +1266,7 @@ fn write_grouped_knobs(s: &mut Session, knobs: &[PrevKnobWrite]) -> Result<(), S
             .filter(|(_, k)| k.scene_slot == scene)
             .map(|(lk, k)| (lk, k.value))
             .collect();
-        set_knobs(s, &group)?;
+        set_knobs(s, &group, saved)?;
         let _ = s.heartbeat();
     }
     Ok(())
@@ -1184,6 +1336,7 @@ pub fn level_preset(
                     verify_by_ear: false,
                     previous_level: None,
                     true_peak_dbtp: None,
+                    persist_mismatch: None,
                 });
             }
             Err(e) => return Err(e),
@@ -1227,6 +1380,7 @@ pub fn level_preset(
                         ref_level,
                         final_level,
                     )),
+                    persist_mismatch: None,
                 });
             }
         }
@@ -1270,6 +1424,7 @@ pub fn level_preset(
                 ref_level,
                 final_level,
             )),
+            persist_mismatch: None,
         })
     })();
     restore_after_unsaved_error(slot, opts.save, result)
@@ -1367,6 +1522,7 @@ pub fn level_setlist(
             verify_by_ear: false,
             previous_level: None,
             true_peak_dbtp: None,
+            persist_mismatch: None,
         });
     }
 
@@ -1464,6 +1620,33 @@ pub struct SceneLevelBenchmarkRow {
     pub failure: Option<String>,
 }
 
+/// The field-8 saved doc `set_knobs` needs for its Scene Edit decision, for the ENTRY
+/// POINTS that can't be handed one: the probe/legacy/restore seams whose callers live
+/// outside the leveling run that already read it (`level_preset_block`,
+/// `mute_floor_report`, `restore_redistribution`, the bench runner). Reads ONLY when a
+/// scene target is actually present, so every base/`presetLevel` path pays nothing, and
+/// ONCE per run — the batched scene runners take the command's single read instead
+/// (`read_saved_preset`'s read-once contract). `None` (read failed) makes `set_knobs`
+/// refuse the scene write rather than guess.
+fn saved_for_scene_knobs<'a>(
+    slot: u32,
+    knobs: impl IntoIterator<Item = &'a LevelKnob>,
+) -> Option<serde_json::Value> {
+    knobs
+        .into_iter()
+        .any(|k| {
+            matches!(
+                k,
+                LevelKnob::Block {
+                    scene_slot: Some(_),
+                    ..
+                }
+            )
+        })
+        .then(|| read_saved_preset(slot))
+        .flatten()
+}
+
 /// Recall base explicitly (`BASE_SCENE_SLOT`) + the standard post-recall settle —
 /// shared by every base-context write/save seam that isn't already inside a
 /// per-scene Scene Edit dance (which pays its own `SETTLE_AFTER_SCENE_RECALL_MS`
@@ -1474,16 +1657,66 @@ fn recall_base(s: &mut Session) -> Result<(), String> {
     Ok(())
 }
 
+/// Recall the preset's ORIGINAL `lastLoadedScene` right before a save, so the save
+/// re-stamps it instead of whatever scene the run left active (HW: a base-context
+/// leveling save silently rewrote the preset's on-load scene, 3 → 8). Unsaved writes
+/// survive the recall (HW, `probe --defer-scenes`). `None` = no recall (old behavior).
+/// The ONE pre-save recall shared by `apply_levels`, `save_deferred_scene_writes`, and
+/// `write_fs_values_on_session` — a settle-timing fix here fixes all three.
+fn recall_original_scene(s: &mut Session, restore_scene: Option<u32>) -> Result<(), String> {
+    if let Some(scene) = restore_scene {
+        s.load_scene(scene)?;
+        std::thread::sleep(Duration::from_millis(SETTLE_AFTER_SET_MS));
+    }
+    Ok(())
+}
+
+/// The ONE pre-save sequence every batch/deferred save shares: recall the preset's
+/// original scene, re-assert any unsaved `presetLevel` the recall just reverted,
+/// then save. The recall's `loadScene` — base included — runs the device's own
+/// level-apply (the same mechanism as the "`load_preset` + `set_preset_level` in
+/// one connection → the set is overridden" gotcha), so an unsaved working-copy
+/// `presetLevel` is silently reverted to the SAVED value right before the save
+/// persists it (HW: `probe --levelpreset 400 -24 save` solved 0.3096 and the saved
+/// doc still read the prior 0.32; caught by the online `level-rerun` base
+/// idempotency spec). Node/overlay writes are immune (the footswitch
+/// `switch_at_target` re-run spec proves `valueA` persists through the recall), so
+/// only `reassert_pl` — the unsaved level a caller solved (`apply_levels`) or
+/// raised (`redistribute_clamped_headroom`) — needs re-writing, and only when a
+/// recall actually ran. Timing stays under the idle-gap cliff: recall +
+/// `SETTLE_AFTER_SET_MS` → set + `SETTLE_AFTER_SET_MS` → save. The re-assert
+/// deliberately does NOT defeat the restore: `setPresetLevel` emits no
+/// `loadScene`, so the scene the save stamps is still the recalled one (pinned by
+/// `recall_reassert_save_replays_the_unsaved_level_after_the_recall`).
+fn recall_reassert_save(
+    s: &mut Session,
+    slot: u32,
+    restore_scene: Option<u32>,
+    reassert_pl: Option<f32>,
+) -> Result<(), String> {
+    recall_original_scene(s, restore_scene)?;
+    if let (Some(pl), Some(_)) = (reassert_pl, restore_scene) {
+        s.set_preset_level(pl)?;
+        std::thread::sleep(Duration::from_millis(SETTLE_AFTER_SET_MS));
+    }
+    s.save_current_preset(slot)
+}
+
 /// Set the chosen knob to `value` on an open session (before re-amp engage). The
 /// single-knob case of `set_knobs` — see its doc for the recall/write ordering
-/// rules. Must be the FIRST write on the connection when `knob` is a `Block`
-/// (its own scene recall, base or otherwise, reverts any earlier unsaved write
-/// on this session — see `capture_on_session`'s doc); callers writing
-/// force-bypass isolation first (`measure_knob_at`) must only pair it with a
-/// `Block` knob when `force_bypass` is empty, or reorder to bypass AFTER this
-/// call, matching `capture_on_session`.
-fn set_knob(s: &mut Session, knob: &LevelKnob, value: f32) -> Result<(), String> {
-    set_knobs(s, &[(knob, value)])
+/// rules and what `saved` is for. Must be the FIRST write on the connection when
+/// `knob` is a `Block`: its own scene recall, base or otherwise, reverts any
+/// earlier unsaved write on this session AND re-asserts that scene's own bypass
+/// state (see `capture_on_session`'s doc), so a caller doing force-bypass
+/// isolation must write the bypasses AFTER this call, never before
+/// (`measure_knob_at`/`measure_fs_at` follow that order).
+fn set_knob(
+    s: &mut Session,
+    knob: &LevelKnob,
+    value: f32,
+    saved: Option<&serde_json::Value>,
+) -> Result<(), String> {
+    set_knobs(s, &[(knob, value)], saved)
 }
 
 /// Write ONLY the knob value (no scene re-activation) — the live loop's
@@ -1499,16 +1732,12 @@ fn set_knob_value_only(s: &mut Session, knob: &LevelKnob, value: f32) -> Result<
         }
         // `bypass` is a distinct wire message (`ChangeParameter.boolVal`, field 7) from
         // every other block param (a plain float field) — see `Session::change_parameter`
-        // vs `change_parameter_bool`. A `SceneJob::repair` bypass entry rides the same
-        // `(LevelKnob, f32)` shape as every other repair param (0.0/1.0 encoding), so the
-        // dispatch lives here rather than widening `LevelKnob`. NOT the same shape as
+        // vs `change_parameter_bool`. A bypass value rides the same `(LevelKnob, f32)` shape
+        // as every other knob (0.0/1.0 encoding), so the dispatch lives here rather than
+        // widening `LevelKnob`. NOT the same shape as
         // `capture_on_session`/`measure_knob_at`/`measure_fs_at`'s typed
-        // `&[(String, String, bool)]` force-bypass side channels — deliberately: those
-        // write BEFORE a separate connect/engage sequence, outside `set_knobs` entirely,
-        // while a repair bypass must ride INSIDE the same `set_knobs` batch as its node's
-        // leveled knob (same dedup, same scene-edit enable, same ~700 ms window) —
-        // widening `set_knobs`'s `targets: &[(&LevelKnob, f32)]` signature to carry a
-        // second, differently-typed side channel was the tradeoff the plan ruled out.
+        // `&[(String, String, bool)]` force-bypass side channels — those write BEFORE a
+        // separate connect/engage sequence, outside `set_knobs` entirely.
         LevelKnob::Block {
             group_id,
             node_id,
@@ -1534,13 +1763,30 @@ fn set_knob_value_only(s: &mut Session, knob: &LevelKnob, value: f32) -> Result<
 /// every per-scene block → ONE settle → write every value.
 ///
 /// * A target set with a `Block { scene_slot: Some(n), .. }` recalls scene `n`,
-///   then enables Scene Edit on every per-scene block so its params become
-///   scene-specific — MUST happen before the value write, or the write hits the
-///   BASE/global value and leaks across scenes (HW). Re-asserted on EVERY
-///   connection (scene + scene-edit don't survive the leveller's reconnects).
-///   The settles must stay SHORT: the device silently drops the write past
-///   ~700 ms after `loadScene` (see `SETTLE_AFTER_SCENE_EDIT_MS`); the rare
-///   too-fast leak-to-base race is covered by the verify + correction pass.
+///   then enables Scene Edit on every per-scene block whose node has NO overlay in
+///   that scene — and ONLY those. The enable RESEEDS the node's whole scene overlay
+///   from base (HW 3-cell matrix, `probe_api/slot_write.rs`), so it is required
+///   where the overlay is absent (it is what materialises it; without it the write
+///   LEAKS TO BASE) and actively destructive where the overlay exists (the write
+///   lands on the overlay anyway, and the enable wipes the scene's other stored
+///   params). `saved` — the slot's field-8 preset JSON, read ONCE per run and
+///   threaded (`probe_api::scene_jobs::read_saved_preset`) — is the only source
+///   that can tell the two apart: after `overlay_scene_onto_graph` a base value is
+///   indistinguishable from an overlaid one, so the live docs can't answer it.
+///   `SceneOverlay::Unknown` (truncated read) or no `saved` at all ⇒ REFUSE the
+///   batch before any device write; both write shapes corrupt from there.
+///   Re-asserted on EVERY connection (scene + scene-edit don't survive the
+///   leveller's reconnects) — including the enable, since `saved` is a pre-run
+///   snapshot: an overlay this run just materialised still reads Absent, so the
+///   enable repeats and reseeds again. Harmless, because the leveled write always
+///   follows it inside the same batch — do NOT "optimise" it into a cached
+///   per-node enabled set, which would drop the enable on a later connection where
+///   the device no longer has scene edit armed.
+///   The settles must stay SHORT: the device silently drops a write after a
+///   ~400–450 ms pre-write IDLE gap (see `SETTLE_AFTER_SCENE_EDIT_MS` — a
+///   per-command cliff, so a settle is slept ONLY when its command was sent);
+///   the rare too-fast leak-to-base race is covered by the verify + correction
+///   pass.
 /// * A base-only target set (`Block { scene_slot: None, .. }`, no `Some`) gets
 ///   an explicit base recall — a bare write with no preceding `loadScene` lands
 ///   in whatever scene the connection defaults to (the preset's saved
@@ -1550,7 +1796,11 @@ fn set_knob_value_only(s: &mut Session, knob: &LevelKnob, value: f32) -> Result<
 ///   a different wire message and a global multiplier, not a scene-scoped
 ///   `changeParameter`, so a recall there would only risk reverting an unsaved
 ///   presetLevel write for no benefit.
-fn set_knobs(s: &mut Session, targets: &[(&LevelKnob, f32)]) -> Result<(), String> {
+fn set_knobs(
+    s: &mut Session,
+    targets: &[(&LevelKnob, f32)],
+    saved: Option<&serde_json::Value>,
+) -> Result<(), String> {
     // ONE scene per batch, ENFORCED not just documented: only the first scene found is
     // recalled below, so a batch mixing two scenes would land every write in that first
     // scene's overlay — silently, with each write confirming normally. Refuse instead.
@@ -1596,13 +1846,13 @@ fn set_knobs(s: &mut Session, targets: &[(&LevelKnob, f32)]) -> Result<(), Strin
             scene.unwrap_or_default()
         ));
     }
+    // Which nodes need the Scene Edit enable — decided BEFORE any device write, so an
+    // unanswerable overlay state refuses with the preset untouched. Deduped by
+    // (group_id, node_id): two targets on one node share one enable, and re-enabling an
+    // already-enabled node re-triggers the reseed (HW 3-cell matrix) — not cosmetic.
+    let mut needs_enable: Vec<(&str, &str)> = Vec::new();
     if let Some(scene) = scene {
-        s.load_scene(scene)?;
-        std::thread::sleep(Duration::from_millis(SETTLE_AFTER_SCENE_RECALL_MS));
-        // Dedupe by (group_id, node_id): a repair target adds MORE entries for the SAME
-        // node as its leveled knob, and re-enabling Scene Edit on an already-enabled node
-        // would itself re-trigger the reseed (HW 3-cell matrix) — not cosmetic.
-        let mut enabled: Vec<(&str, &str)> = Vec::new();
+        let mut seen: Vec<(&str, &str)> = Vec::new();
         for (k, _) in targets {
             if let LevelKnob::Block {
                 group_id,
@@ -1612,18 +1862,64 @@ fn set_knobs(s: &mut Session, targets: &[(&LevelKnob, f32)]) -> Result<(), Strin
             } = k
             {
                 let key = (group_id.as_str(), node_id.as_str());
-                if !enabled.contains(&key) {
-                    s.set_node_scene_edit(group_id, node_id, true)?;
-                    enabled.push(key);
+                if seen.contains(&key) {
+                    continue;
+                }
+                seen.push(key);
+                match saved.map(|sv| scene_overlay(sv, scene, node_id)) {
+                    Some(SceneOverlay::Present(_)) => {}
+                    Some(SceneOverlay::Absent) => needs_enable.push(key),
+                    Some(SceneOverlay::Unknown) | None => {
+                        return Err(format!(
+                            "set_knobs: refusing to write {group_id}/{node_id} in scene {scene} — \
+                             the saved preset does not say whether that node already has a scene \
+                             overlay ({}), and both write shapes corrupt it (enable reseeds an \
+                             existing overlay from base; omitting it leaks the write to base)",
+                            if saved.is_some() {
+                                "truncated field-8 read"
+                            } else {
+                                "no saved-preset read"
+                            }
+                        ));
+                    }
                 }
             }
         }
-        std::thread::sleep(Duration::from_millis(SETTLE_AFTER_SCENE_EDIT_MS));
+    }
+    // Repro instrumentation: wall-clock every step relative to the loadScene recall,
+    // to observe idle gaps crossing the ~400-450 ms silent-drop cliff (see
+    // `SETTLE_AFTER_SCENE_EDIT_MS`).
+    let t0 = std::time::Instant::now();
+    if let Some(scene) = scene {
+        s.load_scene(scene)?;
+        log::info!(
+            "set_knobs[t] scene {scene}: loadScene returned at {} ms",
+            t0.elapsed().as_millis()
+        );
+        std::thread::sleep(Duration::from_millis(SETTLE_AFTER_SCENE_RECALL_MS));
+        for (group_id, node_id) in &needs_enable {
+            s.set_node_scene_edit(group_id, node_id, true)?;
+            log::info!(
+                "set_knobs[t]: SceneEdit({node_id}) returned at {} ms",
+                t0.elapsed().as_millis()
+            );
+        }
+        // Settle ONLY when an enable was actually sent — a settle for a command that
+        // wasn't is pure idle and rides the ~400-450 ms silent-drop cliff (see
+        // `SETTLE_AFTER_SCENE_EDIT_MS`'s doc for the HW evidence).
+        if !needs_enable.is_empty() {
+            std::thread::sleep(Duration::from_millis(SETTLE_AFTER_SCENE_EDIT_MS));
+        }
     } else if has_base_block {
         recall_base(s)?;
     }
     for (k, v) in targets {
         set_knob_value_only(s, k, *v)?;
+        log::info!(
+            "set_knobs[t]: write {}={v:.4} returned at {} ms",
+            k.label(),
+            t0.elapsed().as_millis()
+        );
     }
     Ok(())
 }
@@ -1699,22 +1995,50 @@ fn measure_scene_asis(scene_slot: u32, stimulus: &[f32]) -> Result<lufs::Loudnes
     engage_measure_disengage(&mut s, stimulus)
 }
 
-/// Fresh-connect, set `knob`=`value` (before engage), engage re-amp once,
-/// measure the loudest channel on the full capture. Restores re-amp OFF.
+/// Everything an isolated measurement writes on its connection BEFORE the re-amp engage,
+/// in the ONE order the device's rules allow — the shared arming seam (`measure_knob_at`,
+/// `measure_fs_at`), unit-tested against `SimDevice` since the engage/capture tail can't be.
+///
+/// 1. SCENE CONTEXT FIRST. A preset loads into its SAVED `lastLoadedScene`, never base
+///    (HW), so a measurement that recalls nothing measures whatever scene the connection
+///    happened to hold — the reported bug where a base/footswitch job was measured in
+///    scene 3. `set_knobs` recalls the knob's own context (the scene for a scene knob,
+///    base for a base block); `PresetLevel` is a global multiplier it deliberately does
+///    NOT recall for, so the base recall is issued here.
+/// 2. ISOLATION LAST. `load_scene` re-asserts that scene's own bypass state
+///    (`capture_on_session`'s rule), so forced bypasses written before the recall are
+///    silently reverted. Every capture that recalls therefore re-sends the FULL list.
+fn arm_measurement(
+    s: &mut Session,
+    knob: &LevelKnob,
+    value: f32,
+    force_bypass: &[(String, String, bool)],
+    saved: Option<&serde_json::Value>,
+) -> Result<(), String> {
+    if matches!(knob, LevelKnob::PresetLevel) {
+        recall_base(s)?;
+    }
+    set_knob(s, knob, value, saved)?;
+    for (g, n, byp) in force_bypass {
+        s.change_parameter_bool(g, n, "bypass", *byp)?;
+    }
+    // Cancellable: nothing is engaged yet and the connection is throwaway, so a Stop
+    // here bails cleanly (the same settle #128 made interruptible pre-refactor).
+    sleep_or_cancel(SETTLE_AFTER_SET_MS)?;
+    Ok(())
+}
+
+/// Fresh-connect, arm the measurement (`arm_measurement`: scene context → knob → isolation),
+/// engage re-amp once, measure the loudest channel on the full capture. Restores re-amp OFF.
 fn measure_knob_at(
     stimulus: &[f32],
     knob: &LevelKnob,
     value: f32,
     force_bypass: &[(String, String, bool)],
+    saved: Option<&serde_json::Value>,
 ) -> Result<lufs::Loudness, String> {
     let mut s = Session::connect_lean()?;
-    // Force footswitch-block bypasses BEFORE the knob set + single re-amp engage so they latch —
-    // the same connect → bypasses → set → engage ordering the footswitch `measure_at` proves.
-    for (g, n, byp) in force_bypass {
-        s.change_parameter_bool(g, n, "bypass", *byp)?;
-    }
-    set_knob(&mut s, knob, value)?;
-    sleep_or_cancel(SETTLE_AFTER_SET_MS)?;
+    arm_measurement(&mut s, knob, value, force_bypass, saved)?;
     engage_measure_disengage(&mut s, stimulus)
 }
 
@@ -1740,7 +2064,15 @@ pub struct FootswitchLevelResult {
     pub target_lufs: f64,
     /// Achieved engaged loudness at `final_value`.
     pub predicted_lufs: f64,
+    /// The knob RAN OUT: the solved value sits at a `[0,1]` bound and target lies beyond it,
+    /// so this sound cannot reach target at all. Distinct from `unconverged` below — the UI
+    /// must not tell a user to retry something physically unreachable.
     pub clamped: bool,
+    /// Off target but the knob still had room: the bounded secant spent its
+    /// `MEASURE_CORRECT_MAX` captures mid-range (a compressed / noisy response), so the best
+    /// point found is reported and a RE-RUN can improve it. Previously collapsed into
+    /// `clamped` with no reason — three states behind one flag.
+    pub unconverged: bool,
     pub clamp_reason: Option<String>,
     pub saved: bool,
     pub verify_lufs: Option<f64>,
@@ -1774,7 +2106,14 @@ pub enum FsWrite {
     },
     /// Bake the solved value straight onto the block (`change_parameter`), and clear a
     /// now-redundant `param` function at `clear_stale` so the bake is the single source.
-    Bake { clear_stale: Option<u32> },
+    Bake {
+        clear_stale: Option<u32>,
+        /// Scenes whose overlay restates the base value of the leveled param — the solved
+        /// value is also written into each (scene recall + bare write; the overlay exists,
+        /// so no Scene Edit enable), else the full-param overlay masks the bake whenever
+        /// a scene is active. See `footswitch::FsLevelPlan::Bake::mirror_scenes`.
+        mirror_scenes: Vec<u32>,
+    },
 }
 
 /// Adopt `(v, l)` as the new best-so-far when it beats `*best_lufs`'s distance to
@@ -1847,10 +2186,15 @@ fn param_fn_present(ftsw: &serde_json::Value, switch: u32, index: u32, param: &s
         .unwrap_or(false)
 }
 
-/// One fresh-connection engaged-state measurement point for a footswitch job: force the
-/// engaged bypass list, set the swept param, engage re-amp once, measure. The forced
-/// state lives only on this throwaway connection's working-copy edits; the batch write
-/// session's reload discards ALL accumulated sweep pollution at once.
+/// One fresh-connection engaged-state measurement point for a footswitch job: recall BASE,
+/// set the swept param there, force the engaged bypass list, engage re-amp once, measure —
+/// the `arm_measurement` order. The recall is mandatory: a preset loads into its saved
+/// `lastLoadedScene` (HW), so without it the sweep measured (and the solved value described)
+/// whatever scene the preset happened to save, not the footswitch's base sound. Because the
+/// recall re-asserts that scene's bypass state, the FULL isolation list is re-sent here on
+/// EVERY capture — never once per batch. The forced state lives only on this throwaway
+/// connection's working-copy edits; the batch write session's reload discards ALL accumulated
+/// sweep pollution at once.
 pub(crate) fn measure_fs_at(
     lev: (&str, &str, &str),
     engaged_bypass: &[(String, String, bool)],
@@ -1858,12 +2202,36 @@ pub(crate) fn measure_fs_at(
     v: f32,
 ) -> Result<lufs::Loudness, String> {
     let mut s = Session::connect_lean()?;
-    for (g, n, byp) in engaged_bypass {
-        s.change_parameter_bool(g, n, "bypass", *byp)?;
-    }
-    s.change_parameter(lev.0, lev.1, lev.2, v)?;
-    sleep_or_cancel(SETTLE_AFTER_SET_MS)?;
+    let knob = LevelKnob::Block {
+        group_id: lev.0.to_string(),
+        node_id: lev.1.to_string(),
+        parameter_id: lev.2.to_string(),
+        scene_slot: None,
+    };
+    arm_measurement(&mut s, &knob, v, engaged_bypass, None)?;
     engage_measure_disengage(&mut s, stimulus)
+}
+
+/// Verdict on a solved footswitch value: `(clamped, unconverged)` — the footswitch mirror of
+/// the scene path's "report from the FINAL point" rule (`jointk_one_scene`), which likewise
+/// drops the open-loop's initial want. Three outcomes, not one flag: at target → neither;
+/// knob pinned at the bound that blocks the needed direction → CLAMPED (unreachable, a
+/// re-run cannot help); off target with knob room left → UNCONVERGED (the secant ran out of
+/// captures on a compressed/noisy response; the best point is written and a re-run can
+/// improve it). The third state, no-authority (`clamp_reason: Some(..)` from the seed's
+/// routing probe), is decided before this and rides `clamped` as it always did.
+fn classify_fs_outcome(best_v: f32, best_lufs: f64, target_lufs: f64) -> (bool, bool) {
+    if (best_lufs - target_lufs).abs() <= KNOB_TOL_LU {
+        return (false, false);
+    }
+    // Unreachable only when the knob is pinned at the bound that blocks the direction target
+    // needs: maxed and target still LOUDER, or zeroed and target still QUIETER. A bound hit
+    // whose miss points back INTO the knob's range means the search stopped early, not that
+    // the sound can't get there.
+    let pinned_loud = best_v >= LEVEL_MAX - 1e-3 && target_lufs > best_lufs;
+    let pinned_quiet = best_v <= LEVEL_MIN + 1e-3 && target_lufs < best_lufs;
+    let clamped = pinned_loud || pinned_quiet;
+    (clamped, !clamped)
 }
 
 /// Is the switch's engaged loudness already at target (within `KNOB_TOL_LU`, not clamped)?
@@ -1897,26 +2265,37 @@ pub fn measure_footswitch(
     method: &str,
     current_value: Option<f32>,
 ) -> Result<FootswitchLevelResult, String> {
-    // Send the forced engaged-bypass list only on the FIRST successful capture:
-    // working-copy edits persist across HID disconnect/reconnect (HW-proven, fw
-    // 1.8.45 — a fresh zero-write connection measured the forced state exactly),
-    // and no reload happens inside this function's scope (caller contract above).
-    // `forced` is set only on Ok, so an errored capture re-sends the full list.
-    // TMP_FS_ISOLATION_EVERY restores the old per-capture re-send (kill-switch).
-    let isolation_every = std::env::var("TMP_FS_ISOLATION_EVERY").is_ok();
-    let forced = std::cell::Cell::new(false);
-    let measure_at = |v: f32| {
-        let bypass: &[(String, String, bool)] = if !isolation_every && forced.get() {
-            &[]
-        } else {
-            engaged_bypass
-        };
-        let r = measure_fs_at(lev, bypass, stimulus, v);
-        if r.is_ok() {
-            forced.set(true);
-        }
-        r
-    };
+    solve_footswitch(
+        switch,
+        engaged_bypass,
+        stimulus,
+        target_lufs,
+        method,
+        current_value,
+        |bypass, v| measure_fs_at(lev, bypass, stimulus, v),
+    )
+}
+
+/// The device-independent solve loop behind [`measure_footswitch`]: seed → bracket → bounded
+/// secant, with `measure(isolation, v)` doing the actual capture. The isolation list is an
+/// ARGUMENT of every call, not state captured once: each capture recalls a scene (base
+/// included) and a recall RE-ASSERTS that scene's own bypass state, so a once-only forced
+/// write is silently reverted for captures 2..N and every later point measures a
+/// NON-isolated sound. (It used to be sent only on the first successful capture, on the
+/// since-corrected assumption that working-copy edits alone survive the reconnects — they
+/// do, but the recall undoes them.) Injectable so the loop + its outcome verdict are unit
+/// tested without a device.
+#[allow(clippy::too_many_arguments)]
+fn solve_footswitch(
+    switch: u32,
+    engaged_bypass: &[(String, String, bool)],
+    stimulus: &[f32],
+    target_lufs: f64,
+    method: &str,
+    current_value: Option<f32>,
+    mut measure: impl FnMut(&[(String, String, bool)], f32) -> Result<lufs::Loudness, String>,
+) -> Result<FootswitchLevelResult, String> {
+    let mut measure_at = |v: f32| measure(engaged_bypass, v);
 
     // Guaranteed re-amp OFF on a fresh connection — the measurement's last disengage can be
     // dropped, stranding the unit input-muted. (Not the write-confirm fix; just hygiene.)
@@ -1943,6 +2322,7 @@ pub fn measure_footswitch(
                     target_lufs,
                     predicted_lufs: l.integrated_lufs,
                     clamped: false,
+                    unconverged: false,
                     clamp_reason: None,
                     saved: false,
                     verify_lufs: None,
@@ -1978,6 +2358,7 @@ pub fn measure_footswitch(
                 target_lufs,
                 predicted_lufs: MUTE_FLOOR_SILENT_LUFS,
                 clamped: true,
+                unconverged: false,
                 clamp_reason: Some("no signal on USB 1/2".into()),
                 saved: false,
                 verify_lufs: None,
@@ -1997,10 +2378,14 @@ pub fn measure_footswitch(
         } else {
             (v_hi, l_hi.integrated_lufs, l_hi.spread_lu())
         };
+    // A seed pair that cannot move loudness is a physical dead end, not an exhausted
+    // search — it must never advertise a re-run. Set ONLY where no-authority is proven
+    // (the seed/expansion pair below); a mid-loop stall keeps `unconverged`.
+    let mut flat_response = false;
     if err(best_lufs) > KNOB_TOL_LU {
         let mut p0 = (v_lo as f64, l_lo.integrated_lufs);
         let mut p1 = (v_hi as f64, l_hi.integrated_lufs);
-        // Bracket before falling to the plain secant — see `fs_bracket_expansion`'s doc.
+        // Bracket before falling to the correction loop — see `fs_bracket_expansion`'s doc.
         if let Some(v_extreme) = fs_bracket_expansion(
             v_lo,
             l_lo.integrated_lufs,
@@ -2026,36 +2411,91 @@ pub fn measure_footswitch(
                 }
             }
         }
-        // Run the secant only when not already converged AND the (possibly expanded) pair
-        // has authority (still flat → the knob truly can't move loudness here — an honest,
-        // reason-less clamp).
-        if err(best_lufs) > KNOB_TOL_LU && (p1.1 - p0.1).abs() >= KNOB_TOL_LU {
-            for _ in 0..MEASURE_CORRECT_MAX {
-                let Some(raw) = fs_secant_next(p0, p1, target_lufs) else {
-                    break; // flat response — the knob can't move loudness here
-                };
-                let v2 = raw.clamp(0.0, 1.0) as f32;
-                let l2 = require_live(|| measure_at(v2), stimulus)?;
-                iterations += 1;
-                improve_best(
-                    target_lufs,
-                    v2,
-                    &l2,
-                    &mut best_v,
-                    &mut best_lufs,
-                    &mut best_spread,
-                );
-                if err(l2.integrated_lufs) <= KNOB_TOL_LU {
-                    break;
+        // Bracket-aware secant, gated on the pair having authority (still flat → the
+        // knob truly can't move loudness here — an honest, reason-less clamp). Each
+        // iterate interpolates the SAME `fs_secant_next` step; only the endpoint-update
+        // rule differs by pair shape:
+        //   * pair STRADDLES the target → keep the bracket (replace the same-side
+        //     endpoint) with Illinois damping — a repeat on one side halves the retained
+        //     endpoint's offset so a stale far end can't pin the interpolation. This is
+        //     what converges on a steep-taper cliff (HW, Hiwatt fs12: the UniVibe
+        //     `volume` measures −45.6 LUFS at 0.25 but −16.9 at 0.61, a >60 LU/knob-unit
+        //     cliff around the −20 target; the plain sliding secant zig-zagged across it
+        //     and stopped 3.1 LU hot — caught by the strict e2e re-measure).
+        //   * pair does NOT straddle → the plain slide (drop the older point), unchanged
+        //     from the validated behavior; the first crossing iterate forms a straddling
+        //     consecutive pair, which flips the loop into bracket mode by itself.
+        if err(best_lufs) > KNOB_TOL_LU {
+            if (p1.1 - p0.1).abs() < KNOB_TOL_LU {
+                // The seed pair itself is flat (and the expansion probe didn't land
+                // it): the knob demonstrably can't move loudness, the correction loop
+                // has nothing to interpolate on, and best_v sits mid-range. This is
+                // the ONE place no-authority is proven — the noise-robust KNOB_TOL_LU
+                // band over the widest pair the solve ever holds.
+                flat_response = true;
+            } else {
+                // −1 / +1: which side of the target the previous bracket-mode iterate
+                // landed on (0 until the pair straddles).
+                let mut last_side = 0i8;
+                for _ in 0..FS_CORRECT_MAX {
+                    let straddles = (p0.1 - target_lufs) * (p1.1 - target_lufs) < 0.0;
+                    let Some(raw) = fs_secant_next(p0, p1, target_lufs) else {
+                        // NOT a no-authority verdict: this loop is only entered after
+                        // the seeds proved ≥ KNOB_TOL_LU of authority, so a mid-loop
+                        // flat/degenerate pair (e.g. both endpoints clamped onto the
+                        // same bound on a non-monotone response) means the SEARCH is
+                        // stuck, not that the knob is dead — keep the honest
+                        // `unconverged` from classify_fs_outcome below.
+                        break;
+                    };
+                    let v2 = raw.clamp(0.0, 1.0) as f32;
+                    let l2 = require_live(|| measure_at(v2), stimulus)?;
+                    iterations += 1;
+                    improve_best(
+                        target_lufs,
+                        v2,
+                        &l2,
+                        &mut best_v,
+                        &mut best_lufs,
+                        &mut best_spread,
+                    );
+                    if err(l2.integrated_lufs) <= KNOB_TOL_LU {
+                        break;
+                    }
+                    let p2 = (v2 as f64, l2.integrated_lufs);
+                    if straddles {
+                        if (p2.1 - target_lufs) * (p0.1 - target_lufs) > 0.0 {
+                            if last_side == -1 {
+                                p1.1 = target_lufs + (p1.1 - target_lufs) / 2.0;
+                            }
+                            p0 = p2;
+                            last_side = -1;
+                        } else {
+                            if last_side == 1 {
+                                p0.1 = target_lufs + (p0.1 - target_lufs) / 2.0;
+                            }
+                            p1 = p2;
+                            last_side = 1;
+                        }
+                    } else {
+                        p0 = p1;
+                        p1 = p2;
+                        last_side = 0;
+                    }
                 }
-                p0 = p1;
-                p1 = (v2 as f64, l2.integrated_lufs);
             }
         }
     }
-    // Signal is present past the seed probe, so a miss is a headroom/authority clamp, never a
-    // routing error → `clamp_reason` stays None (the UI shows "clamped at X LUFS").
-    let clamped = err(best_lufs) > KNOB_TOL_LU;
+    // Signal is present past the seed probe, so a miss is a headroom or convergence limit,
+    // never a routing error → `clamp_reason` stays None (that reason belongs to the seed's
+    // routing probe alone). A FLAT response is the exception: the knob has no authority
+    // over loudness, so a re-run repeats the same miss — report it as the reason-less
+    // clamp (the scene lane's precedent), never as `unconverged`.
+    let (clamped, unconverged) = if flat_response {
+        (true, false)
+    } else {
+        classify_fs_outcome(best_v, best_lufs, target_lufs)
+    };
     Ok(FootswitchLevelResult {
         switch,
         measured_lufs: l_lo.integrated_lufs,
@@ -2063,6 +2503,7 @@ pub fn measure_footswitch(
         target_lufs,
         predicted_lufs: best_lufs,
         clamped,
+        unconverged,
         clamp_reason: None,
         saved: false,
         verify_lufs: None,
@@ -2102,6 +2543,7 @@ pub fn level_footswitch(
     target_lufs: f64,
     save: bool,
     verify: bool,
+    restore_scene: Option<u32>,
 ) -> Result<FootswitchLevelResult, String> {
     let body = || -> Result<FootswitchLevelResult, String> {
         // Load the preset in its own connection (re-amp latch workaround), then measure on
@@ -2149,7 +2591,7 @@ pub fn level_footswitch(
                 write: write.clone(),
                 value: result.final_value,
             }];
-            write_footswitch_values(slot, &pending)?;
+            write_footswitch_values(slot, &pending, restore_scene)?;
             result.saved = true;
             if verify {
                 std::thread::sleep(Duration::from_millis(RECONNECT_GAP_MS));
@@ -2198,19 +2640,16 @@ pub fn level_footswitch(
 /// (field-54 echo / read-back, retry-once, never save on `presetError`); ANY
 /// unconfirmed write aborts BEFORE the save, so nothing half-applied persists.
 ///
-/// KNOWN GAP (deliberately NOT fixed here, unlike `set_knob`/`set_knobs`/
-/// `capture_full_at`): `FsWrite::Bake`'s writes are base-context `changeParameter`
-/// calls with no preceding `load_scene`, so they're exposed to the same
-/// leaks-to-`lastLoadedScene` bug those seams fix. A single `load_scene
-/// (BASE_SCENE_SLOT)` before the `pending` loop would close it — BUT `pending`
-/// can carry several confirm-gated writes (`FsWrite::Assign`'s own retry-once
-/// already costs up to 2×(set + 3×200 ms poll) ≈ 1.8 s for ONE item), and the
-/// device silently drops a scene write past ~700 ms after `loadScene`
-/// (`SETTLE_AFTER_SCENE_EDIT_MS`'s doc). Adding the recall without first
-/// HW-bisecting the batch's real elapsed time risks a WORSE regression: later
-/// items in a multi-switch batch silently failing to land instead of the
-/// current wrong-scene bug. Land the recall in its own HW-verified commit.
-pub fn write_footswitch_values(slot: u32, pending: &[FsPendingWrite]) -> Result<(), String> {
+/// A `FsWrite::Bake` persists the solved value with `changeParameter`, which lands in
+/// whatever scene the connection currently holds — and the load below activates the preset's
+/// SAVED `lastLoadedScene`, not base (HW). Hence the mandatory base recall: without it a
+/// scened preset's bake landed in that scene's overlay while BASE — the state the leveler
+/// measured, and the one the switch's off position renders — kept its old value.
+pub fn write_footswitch_values(
+    slot: u32,
+    pending: &[FsPendingWrite],
+    restore_scene: Option<u32>,
+) -> Result<(), String> {
     if pending.is_empty() {
         return Ok(());
     }
@@ -2218,6 +2657,26 @@ pub fn write_footswitch_values(slot: u32, pending: &[FsPendingWrite]) -> Result<
     let _ = Session::connect_lean().map(|mut s| s.set_reamp_mode(false));
     std::thread::sleep(Duration::from_millis(RECONNECT_GAP_MS));
     let mut s = Session::connect()?;
+    write_fs_values_on_session(&mut s, slot, pending, restore_scene)
+}
+
+/// [`write_footswitch_values`]' body on an ALREADY-OPEN session — split out so the write
+/// order (load → warmup → BASE recall → confirm-gated writes → ONE save) is unit-tested
+/// against `SimDevice` with no real HID open.
+///
+/// The recall is issued ONCE, before the loop, never per item: `load_scene` reverts prior
+/// UNSAVED writes to the recalled context, so a per-item recall would undo the earlier
+/// bakes. The ~700 ms post-`loadScene` acceptance cliff that once argued against recalling
+/// at all here is a SCENE-OVERLAY phenomenon (it gates writes needing the per-node Scene
+/// Edit arming); these are base-context writes with no arming. RE-VERIFY ON HW for a
+/// multi-switch batch: if a later item's bake stops landing, that cliff applies to base
+/// writes too and the fix is to split the batch, not to drop the recall.
+fn write_fs_values_on_session(
+    s: &mut Session,
+    slot: u32,
+    pending: &[FsPendingWrite],
+    restore_scene: Option<u32>,
+) -> Result<(), String> {
     s.begin_live_edit()?;
     s.load_preset(slot)?;
     let name = s.active_preset_name().unwrap_or_default();
@@ -2228,6 +2687,8 @@ pub fn write_footswitch_values(slot: u32, pending: &[FsPendingWrite]) -> Result<
         let _ = s.heartbeat();
         let _ = s.pump_collect(150);
     }
+    // Base is a RECALL (wire slot 8), never an omission — see this function's doc.
+    recall_base(s)?;
     for p in pending {
         let (group, node, param) = (&p.lev.0, &p.lev.1, &p.lev.2);
         match &p.write {
@@ -2280,7 +2741,7 @@ pub fn write_footswitch_values(slot: u32, pending: &[FsPendingWrite]) -> Result<
                     ));
                 }
             }
-            FsWrite::Bake { clear_stale } => {
+            FsWrite::Bake { clear_stale, .. } => {
                 // Clear a now-redundant param fn FIRST (a chunked `ftsw` edit — done while the
                 // session is freshest), confirming it's gone (else its valueA would override the
                 // baked value when engaged). Then bake the value onto the block. Abort before
@@ -2318,6 +2779,29 @@ pub fn write_footswitch_values(slot: u32, pending: &[FsPendingWrite]) -> Result<
         let _ = s.heartbeat();
         let _ = s.pump_collect(150);
     }
+    // Mirror each bake into the scenes whose overlay restated the base value (grouped by
+    // scene: one recall, then that scene's writes back-to-back — the write must follow its
+    // recall inside the ~400 ms idle-gap acceptance window; the overlay exists by
+    // construction, so no Scene Edit enable). Unsaved writes survive the recalls (HW,
+    // `probe --defer-scenes`); the single save below persists base + every overlay.
+    let mut by_scene: std::collections::BTreeMap<u32, Vec<&FsPendingWrite>> =
+        std::collections::BTreeMap::new();
+    for p in pending {
+        if let FsWrite::Bake { mirror_scenes, .. } = &p.write {
+            for &scene in mirror_scenes {
+                by_scene.entry(scene).or_default().push(p);
+            }
+        }
+    }
+    for (scene, writes) in &by_scene {
+        s.load_scene(*scene)?;
+        std::thread::sleep(Duration::from_millis(SETTLE_AFTER_SCENE_RECALL_MS));
+        for p in writes {
+            s.change_parameter(&p.lev.0, &p.lev.1, &p.lev.2, p.value)?;
+        }
+        let _ = s.heartbeat();
+    }
+    recall_original_scene(s, restore_scene)?;
     s.save_current_preset(slot)?;
     Ok(())
 }
@@ -2464,6 +2948,11 @@ pub struct BatchedSceneOutcome {
     /// close enough to a solo lane that bleed may have skewed the equal-solo balance (the
     /// overall target is still hit). `false` outside rebalance.
     pub verify_by_ear: bool,
+    /// Post-save param-level verify (`verify_persisted_writes`): `Some(true)` = the saved
+    /// preset does NOT hold the value this outcome reports, so the number above is
+    /// pre-wipe and must not be trusted; `Some(false)` = re-read and confirmed. `None` =
+    /// not checked (the scene wrote nothing, the run didn't save, or the re-read failed).
+    pub persist_mismatch: Option<bool>,
 }
 
 /// One amp knob to drive within a scene: the control, its bounds, and its current
@@ -2499,21 +2988,6 @@ pub struct SceneJob {
     /// output) — the rebalance flow may adjust the lanes' mix. False for series, single
     /// amp, and split-OUTPUT scenes (separate physical outs have no shared mix).
     pub rebalanceable: bool,
-    /// Other params on the knob(s)' own node(s) that diverge between this scene's
-    /// materialized doc and base — repaired by an extra write RIGHT AFTER the leveled
-    /// knob, on every apply, because `SetNodeSceneEdit(node, true)` RESEEDS that node's
-    /// ENTIRE scene overlay from base (HW 3-cell isolation matrix, `probe_api/slot_write.rs`),
-    /// silently wiping any other already-scene-edited param on the same node — not just a
-    /// leak-by-order race. `build_scene_jobs` computes this from the scene vs. base doc,
-    /// excluding the param being leveled, capped at `SCENE_REPAIR_MAX_PARAMS` most-divergent
-    /// (a `log::warn` names anything dropped past the cap — the ~700 ms post-`loadScene`
-    /// write window bounds how much a single connection can safely carry). A `"bypass"`
-    /// entry (encoded 0.0/1.0) always survives the cap — see `set_knob_value_only`'s bool
-    /// dispatch — since the reseed's HW-proven scope is per-node, not per-param-type, and a
-    /// redundant correct-value bypass write is harmless where a dropped one is not. Empty
-    /// for a base-only job (`scene_slot: None` targets recall base, never enable Scene
-    /// Edit, so there is nothing to reseed).
-    pub repair: Vec<(LevelKnob, f32)>,
 }
 
 impl SceneJob {
@@ -2531,12 +3005,6 @@ impl SceneJob {
                 n.len()
             )),
         }
-    }
-
-    /// `repair` as borrowed `(&LevelKnob, f32)` pairs, ready to pass alongside the job's
-    /// own leveled knob refs into `apply_first_verified`/`correct_iter`.
-    fn repair_refs(&self) -> Vec<(&LevelKnob, f32)> {
-        self.repair.iter().map(|(k, v)| (k, *v)).collect()
     }
 }
 
@@ -2557,6 +3025,7 @@ pub fn level_scenes_live_batched(
     jobs: &[SceneJob],
     stimulus: &[f32],
     save: bool,
+    saved: Option<&serde_json::Value>,
     mut on_scene: impl FnMut(u32, Option<&BatchedSceneOutcome>),
     mut cancelled: impl FnMut() -> bool,
 ) -> Result<Vec<BatchedSceneOutcome>, String> {
@@ -2593,7 +3062,7 @@ pub fn level_scenes_live_batched(
                 // Fresh engage connection per scene: scene recall + Scene Edit
                 // + start value ride `set_knob` BEFORE the engage (latch rule).
                 let mut s = Session::connect()?;
-                set_knob(&mut s, &kt.knob, kt.current.clamp(kt.lo, kt.hi))?;
+                set_knob(&mut s, &kt.knob, kt.current.clamp(kt.lo, kt.hi), saved)?;
                 *writes += 1;
                 std::thread::sleep(Duration::from_millis(SETTLE_AFTER_SET_MS));
                 let _ = s.set_reamp_mode(true)?;
@@ -2676,6 +3145,7 @@ pub fn level_scenes_live_batched(
                     dynamic_spread_lu: None, // live windows carry no full-capture meter
                     clamp_reason: None,
                     verify_by_ear: false,
+                    persist_mismatch: None,
                 },
                 Err(e) if e == CANCELLED => return Err(e),
                 Err(e) => BatchedSceneOutcome {
@@ -2691,6 +3161,7 @@ pub fn level_scenes_live_batched(
                     dynamic_spread_lu: None,
                     clamp_reason: None,
                     verify_by_ear: false,
+                    persist_mismatch: None,
                 },
             };
             on_scene(job.scene_slot, Some(&outcome));
@@ -2729,12 +3200,14 @@ pub fn level_scenes_live_batched(
 /// cancel, so already-reported scenes are never silently lost); `restore_scene`
 /// is recalled first so the save stamps the preset's original active scene. A
 /// per-scene failure becomes a failed outcome, never aborting the run.
+#[allow(clippy::too_many_arguments)]
 pub fn level_scenes_oneshot(
     slot: u32,
     jobs: &[SceneJob],
     stimulus: &[f32],
     save: bool,
     restore_scene: Option<u32>,
+    saved: Option<&serde_json::Value>,
     on_scene: impl FnMut(u32, Option<&BatchedSceneOutcome>),
     cancelled: impl FnMut() -> bool,
 ) -> Result<Vec<BatchedSceneOutcome>, String> {
@@ -2745,7 +3218,7 @@ pub fn level_scenes_oneshot(
         restore_scene,
         on_scene,
         cancelled,
-        |job| jointk_one_scene(slot, job, stimulus, job.target_lufs, save, true),
+        |job| jointk_one_scene(slot, job, stimulus, job.target_lufs, save, true, saved),
     )
 }
 
@@ -2771,12 +3244,14 @@ pub(crate) const REDIST_POST_VERIFY_TOL_LU: f64 = 1.5;
 ///
 /// CALLER CONTRACT (mirrors `level_scenes_oneshot`): the preset is already current (the caller
 /// ran `prepass_scene_docs`), and `jobs`' knobs carry each sound's pre-raise `current` value.
+#[allow(clippy::too_many_arguments)]
 pub fn redistribute_clamped_headroom(
     slot: u32,
     new_preset_level: f32,
     jobs: &[SceneJob],
     stimulus: &[f32],
     restore_scene: Option<u32>,
+    saved: Option<&serde_json::Value>,
     mut on_scene: impl FnMut(u32, Option<&BatchedSceneOutcome>),
     mut cancelled: impl FnMut() -> bool,
 ) -> Result<Vec<BatchedSceneOutcome>, String> {
@@ -2813,7 +3288,7 @@ pub fn redistribute_clamped_headroom(
             outcomes.push(o);
             continue;
         }
-        let result = jointk_one_scene(slot, job, stimulus, job.target_lufs, true, true);
+        let result = jointk_one_scene(slot, job, stimulus, job.target_lufs, true, true, saved);
         std::thread::sleep(Duration::from_millis(RECONNECT_GAP_MS));
         let o = match result {
             Ok(s) => {
@@ -2853,8 +3328,10 @@ pub fn redistribute_clamped_headroom(
         });
     }
 
-    // ONE save — new pl + every compensated outputLevel together, base scene recalled.
-    save_deferred_scene_writes(slot, restore_scene)?;
+    // ONE save — new pl + every compensated outputLevel together, original scene
+    // recalled and the UNSAVED raised pl re-asserted after it (the recall would
+    // otherwise revert it to the saved value — see `recall_reassert_save`).
+    save_deferred_scene_writes(slot, restore_scene, Some(new_preset_level))?;
 
     // Post-save AUDIO spot-verify at the PERSISTED pl (the wrong-pl-solve guard). Pick a
     // compensated sound that actually moved (writes > 0); re-measure it as-is. Advisory —
@@ -2911,6 +3388,8 @@ fn run_scene_jobs(
     let mut outcomes = Vec::with_capacity(jobs.len());
     let mut attempted = false;
     let mut stopped = false;
+    // Every value this batch actually wrote, for the post-save re-read (`verify_persisted_writes`).
+    let mut written: Vec<PersistedWrite> = Vec::new();
     // Every writing scene verifies + self-corrects (see `jointk_one_scene`): a downstream
     // compressor undershoots the open-loop solve per scene, so the canary-only model isn't
     // enough. Cost is one verify capture per off-target scene (none when already at target).
@@ -2942,7 +3421,30 @@ fn run_scene_jobs(
 
         std::thread::sleep(Duration::from_millis(RECONNECT_GAP_MS));
         let outcome = match result {
-            Ok(s) => solved_scene_outcome(job.scene_slot, eff_target, s, t0.elapsed().as_millis()),
+            Ok(s) => {
+                // Harvested BEFORE `solved_scene_outcome` consumes the solve: the outcome keeps
+                // only the loudest lane's level, but every lane amp was written and each one has
+                // to be re-read. `writes == 0` wrote nothing, so there is nothing to confirm.
+                if s.writes > 0 {
+                    written.extend(job.knobs.iter().zip(&s.levels).filter_map(|(k, &v)| {
+                        match &k.knob {
+                            LevelKnob::Block {
+                                node_id,
+                                parameter_id,
+                                ..
+                            } => Some(PersistedWrite {
+                                scene_slot: job.scene_slot,
+                                node_id: node_id.clone(),
+                                parameter_id: parameter_id.clone(),
+                                value: v,
+                            }),
+                            // Not written by a scene job, and not scene-scoped if it were.
+                            LevelKnob::PresetLevel => None,
+                        }
+                    }));
+                }
+                solved_scene_outcome(job.scene_slot, eff_target, s, t0.elapsed().as_millis())
+            }
             Err(e) if e == CANCELLED => {
                 stopped = true;
                 break;
@@ -2962,11 +3464,15 @@ fn run_scene_jobs(
             // The callee already warns internally on its own first failure; this
             // catches the case where its retry ALSO failed (cancelled path only —
             // the non-cancelled `?` below still surfaces a hard error to the caller).
-            if let Err(e) = save_deferred_scene_writes(slot, restore_scene) {
+            if let Err(e) = save_deferred_scene_writes(slot, restore_scene, None) {
                 log::warn!("save_deferred_scene_writes failed on cancel (slot {slot}): {e}");
             }
         } else {
-            save_deferred_scene_writes(slot, restore_scene)?;
+            save_deferred_scene_writes(slot, restore_scene, None)?;
+            // Confirm the save kept what the run reports — no re-capture, one field-8 read,
+            // after every audio step. A stopped run returns CANCELLED below and its outcomes
+            // are discarded, so it is not worth a read.
+            verify_persisted_writes(slot, &written, &mut outcomes);
         }
     }
     if stopped {
@@ -2985,22 +3491,122 @@ fn run_scene_jobs(
 /// retry on a fresh connection (the realistic failure is the HID open lockout, not
 /// the save itself). The connection never toggles re-amp, so the post-re-amp
 /// save-drop cannot bite.
-fn save_deferred_scene_writes(slot: u32, restore_scene: Option<u32>) -> Result<(), String> {
+fn save_deferred_scene_writes(
+    slot: u32,
+    restore_scene: Option<u32>,
+    reassert_pl: Option<f32>,
+) -> Result<(), String> {
     // NOT `sleep_or_cancel`: this is ALSO fired on cancel, to persist the scene overlays
     // already written. Bailing here would throw away the run's completed work.
     let attempt = || -> Result<(), String> {
         std::thread::sleep(Duration::from_millis(RECONNECT_GAP_MS));
         let mut s = Session::connect()?;
-        if let Some(scene) = restore_scene {
-            s.load_scene(scene)?;
-            std::thread::sleep(Duration::from_millis(SETTLE_AFTER_SET_MS));
-        }
-        s.save_current_preset(slot)
+        recall_reassert_save(&mut s, slot, restore_scene, reassert_pl)
     };
     attempt().or_else(|e| {
         log::warn!("deferred scene save failed ({e}); retrying on a fresh connection");
         attempt()
     })
+}
+
+/// One solved scene write, to be checked against what the batch-end save actually persisted.
+#[derive(Debug, Clone)]
+pub(crate) struct PersistedWrite {
+    /// The scene the value was written into; `session::BASE_SCENE_SLOT` = the base graph.
+    pub scene_slot: u32,
+    pub node_id: String,
+    pub parameter_id: String,
+    /// The value the run SOLVED and reported.
+    pub value: f32,
+}
+
+/// Agreement band between a solved `f32` and its round-tripped JSON value. Wide enough for
+/// the float formatting, far below any real leveling step.
+const PERSIST_TOL: f64 = 1e-3;
+
+/// What the saved document holds for one solved write: the SCENE OVERLAY's value for an FS
+/// scene, the base graph node's for base (`scene_overlay` answers `Unknown` at/above
+/// `BASE_SCENE_SLOT`, so base must not go through it).
+fn persisted_value(saved: &serde_json::Value, w: &PersistedWrite) -> Option<f64> {
+    if w.scene_slot >= crate::session::BASE_SCENE_SLOT {
+        return crate::commands::level_footswitch::node_param_f64(
+            saved,
+            &w.node_id,
+            &w.parameter_id,
+        );
+    }
+    match scene_overlay(saved, w.scene_slot, &w.node_id) {
+        SceneOverlay::Present(params) => params.get(&w.parameter_id).and_then(|v| v.as_f64()),
+        SceneOverlay::Absent | SceneOverlay::Unknown => None,
+    }
+}
+
+/// The solved writes the save did NOT persist, as `(scene_slot, detail)`. A write the saved
+/// document cannot answer counts as a MISS: the gate exists so a report can never show
+/// numbers the save wiped, and "can't tell" is not "fine".
+pub(crate) fn persist_mismatches(
+    saved: &serde_json::Value,
+    writes: &[PersistedWrite],
+) -> Vec<(u32, String)> {
+    writes
+        .iter()
+        .filter_map(|w| match persisted_value(saved, w) {
+            Some(got) if (got - w.value as f64).abs() <= PERSIST_TOL => None,
+            Some(got) => Some((
+                w.scene_slot,
+                format!(
+                    "{}/{} solved {:.4} but the save holds {got:.4}",
+                    w.node_id, w.parameter_id, w.value
+                ),
+            )),
+            None => Some((
+                w.scene_slot,
+                format!(
+                    "{}/{} solved {:.4} but the saved preset holds no such value",
+                    w.node_id, w.parameter_id, w.value
+                ),
+            )),
+        })
+        .collect()
+}
+
+/// Post-save param-level verify: RE-READ the preset and confirm every solved write survived
+/// the batch-end save, stamping `persist_mismatch` on each outcome. Cheap and audio-free —
+/// one field-8 read per preset per run, after all capture work — and the one thing that stops
+/// a summary from reporting pre-wipe numbers as persisted. `writes` pairs a scene slot with
+/// the values solved for it; scenes that wrote nothing are not checked.
+fn verify_persisted_writes(
+    slot: u32,
+    writes: &[PersistedWrite],
+    outcomes: &mut [BatchedSceneOutcome],
+) {
+    if writes.is_empty() {
+        return;
+    }
+    // `save_deferred_scene_writes` has just closed its session and `read_saved_preset` sleeps
+    // only AFTER itself, so the opening gap is the caller's to provide.
+    std::thread::sleep(Duration::from_millis(RECONNECT_GAP_MS));
+    let Some(saved) = read_saved_preset(slot) else {
+        log::warn!(
+            "slot {slot}: post-save verify skipped — the saved preset could not be re-read; \
+             the reported values are unconfirmed"
+        );
+        return;
+    };
+    let misses = persist_mismatches(&saved, writes);
+    for o in outcomes.iter_mut() {
+        // Only a scene we actually checked gets a verdict; the rest stay `None` (unknown).
+        if !writes.iter().any(|w| w.scene_slot == o.scene_slot) {
+            continue;
+        }
+        let mismatch = misses.iter().any(|(scene, _)| *scene == o.scene_slot);
+        o.persist_mismatch = Some(mismatch);
+    }
+    for (scene, detail) in &misses {
+        log::warn!(
+            "slot {slot} scene {scene}: the save did not persist the leveled value — {detail}"
+        );
+    }
 }
 
 /// Result of the joint-k solve for a scene's amp-knob set.
@@ -3088,6 +3694,15 @@ struct SceneSolve {
 /// re-inflate per-scene cost toward the legacy 80–93 s regime. (NOT `KNOB_MAX_ITERS`, which
 /// counts 2 seed measurements in its budget.)
 const MEASURE_CORRECT_MAX: u32 = 3;
+
+/// Capture budget for the footswitch solve's bracket-aware secant (see
+/// `solve_footswitch`). Larger than the scene path's `MEASURE_CORRECT_MAX`
+/// because arbitrary block params (a `volume` audio taper, a `drive` knob) can
+/// put the target on a steep cliff that needs several Illinois-damped bracket
+/// iterates (HW, Hiwatt fs12: ~4 from a 21-LU-wide bracket) — converged solves
+/// still exit on the first in-tolerance iterate, so the extra headroom costs
+/// well-behaved knobs nothing.
+const FS_CORRECT_MAX: u32 = 8;
 /// An `outputLevel` change of at least this many dB that moves the captured loudness by
 /// less than `KNOB_TOL_LU` means the amp has no authority over the USB 1/2 capture
 /// (off-branch / off-USB output, or hard-limited downstream).
@@ -3118,6 +3733,7 @@ fn scene_at_target(measured: f64, target: f64, clamped: bool) -> bool {
 /// −22). On a linear chain the first verify is within tol and no correction runs. Shared by
 /// `level_scenes_oneshot` and the rebalance flow's non-mergeable scenes. `verify=false` skips
 /// both verify and correction.
+#[allow(clippy::too_many_arguments)]
 fn jointk_one_scene(
     slot: u32,
     job: &SceneJob,
@@ -3125,6 +3741,7 @@ fn jointk_one_scene(
     target_lufs: f64,
     defer: bool,
     verify: bool,
+    saved: Option<&serde_json::Value>,
 ) -> Result<SceneSolve, String> {
     // Hard-error on a persistent flat read (after the retry). Trade-off, made
     // consciously: a real scene crushed by a limiter (the UA1176 case below) with
@@ -3163,17 +3780,16 @@ fn jointk_one_scene(
     };
     let base: Vec<f32> = job.knobs.iter().map(|kt| kt.current).collect();
     let knob_refs: Vec<&LevelKnob> = job.knobs.iter().map(|kt| &kt.knob).collect();
-    let repair_refs = job.repair_refs();
     let expected_db = 20.0 * k_eff.max(1e-9).log10();
     let (v0, retry_writes) = apply_first_verified(
         slot,
         stimulus,
         &knob_refs,
         &levels,
-        &repair_refs,
         opts,
         expected_db,
         measured,
+        saved,
     )?;
     let (best_lufs, best_levels, clamp_reason, writes) = match v0 {
         Some(v0) if verify => {
@@ -3187,7 +3803,7 @@ fn jointk_one_scene(
                 v0,
                 target_lufs,
                 defer,
-                &repair_refs,
+                saved,
             )?;
             (
                 c.lufs,
@@ -3222,24 +3838,17 @@ fn jointk_one_scene(
 /// 2 dB move. Below it a flat response is ambiguous with noise, so no retry fires.
 const SUSPECT_DROP_MIN_DB: f64 = 2.0;
 
-/// One `set_knobs` batch's targets: the job's own leveled knobs at `levels`, plus its
-/// scene's repair entries (other diverging params the reseed would otherwise wipe —
-/// `SceneJob::repair`'s doc) — appended, never merged into `levels` itself, which
-/// `correct_iter` scales by the correction factor and repair values must not ride.
-/// Shared by `apply_first_verified` and `correct_iter`'s `apply` closure, both of which
-/// call this on every device write (a secant iteration re-triggers the reseed just like
-/// the first apply, so repair must be resent every time, not just once).
-fn merge_repair_targets<'a>(
-    knobs: &[&'a LevelKnob],
-    levels: &[f32],
-    repair: &[(&'a LevelKnob, f32)],
-) -> Vec<(&'a LevelKnob, f32)> {
+/// One `set_knobs` batch's targets: each knob paired with its level. (Superseded
+/// `merge_repair_targets`, which also appended per-scene writes re-asserting params the
+/// Scene Edit reseed would wipe — dead, and HW-proven not to land (8/8 failed): `set_knobs`
+/// now enables Scene Edit ONLY where the node has no overlay, the one case where the reseed
+/// has nothing to lose, so there is nothing left to repair.)
+fn zip_targets<'a>(knobs: &[&'a LevelKnob], levels: &[f32]) -> Vec<(&'a LevelKnob, f32)> {
     knobs
         .iter()
         .copied()
         .zip(levels)
         .map(|(k, &v)| (k, v))
-        .chain(repair.iter().copied())
         .collect()
 }
 
@@ -3257,13 +3866,13 @@ fn apply_first_verified(
     stimulus: &[f32],
     knobs: &[&LevelKnob],
     levels: &[f32],
-    repair: &[(&LevelKnob, f32)],
     opts: LevelOptions,
     expected_db: f64,
     baseline_lufs: f64,
+    saved: Option<&serde_json::Value>,
 ) -> Result<(Option<f64>, u32), String> {
-    let targets = merge_repair_targets(knobs, levels, repair);
-    let v0 = apply_levels(slot, stimulus, &targets, opts, false)?.1;
+    let targets = zip_targets(knobs, levels);
+    let v0 = apply_levels(slot, stimulus, &targets, opts, false, saved)?.1;
     match v0 {
         Some(v)
             if opts.verify
@@ -3271,7 +3880,10 @@ fn apply_first_verified(
                 && (v - baseline_lufs).abs() < KNOB_TOL_LU =>
         {
             std::thread::sleep(Duration::from_millis(RECONNECT_GAP_MS));
-            Ok((apply_levels(slot, stimulus, &targets, opts, false)?.1, 1))
+            Ok((
+                apply_levels(slot, stimulus, &targets, opts, false, saved)?.1,
+                1,
+            ))
         }
         other => Ok((other, 0)),
     }
@@ -3309,7 +3921,7 @@ fn correct_iter(
     v0: f64,
     target: f64,
     defer: bool,
-    repair: &[(&LevelKnob, f32)],
+    saved: Option<&serde_json::Value>,
 ) -> Result<Correction, String> {
     let max_base = base
         .iter()
@@ -3328,8 +3940,8 @@ fn correct_iter(
             defer,
             ..Default::default()
         };
-        let targets = merge_repair_targets(knobs, levels, repair);
-        Ok(apply_levels(slot, stimulus, &targets, opts, false)?.1)
+        let targets = zip_targets(knobs, levels);
+        Ok(apply_levels(slot, stimulus, &targets, opts, false, saved)?.1)
     };
 
     let k0 = levels0[0] as f64 / (base[0].max(1e-3)) as f64; // shared factor (uniform across lanes)
@@ -3454,9 +4066,10 @@ fn no_authority(applied_db: f64, response: f64) -> bool {
 fn measure_knobs_at(
     stimulus: &[f32],
     targets: &[(&LevelKnob, f32)],
+    saved: Option<&serde_json::Value>,
 ) -> Result<lufs::Loudness, String> {
     let mut s = Session::connect_lean()?;
-    set_knobs(&mut s, targets)?;
+    set_knobs(&mut s, targets, saved)?;
     sleep_or_cancel(SETTLE_AFTER_SET_MS)?;
     engage_measure_disengage(&mut s, stimulus)
 }
@@ -3465,8 +4078,13 @@ fn measure_knobs_at(
 /// mute — which `loudest_loudness` reports as "no signal captured"; treat that as a sentinel
 /// deep floor (`MUTE_FLOOR_SILENT_LUFS`), the BEST case (no bleed), rather than failing.
 /// Other capture errors still propagate.
-fn measure_mute_floor(stimulus: &[f32], a: &LevelKnob, b: &LevelKnob) -> Result<f64, String> {
-    match measure_knobs_at(stimulus, &[(a, 0.0), (b, 0.0)]) {
+fn measure_mute_floor(
+    stimulus: &[f32],
+    a: &LevelKnob,
+    b: &LevelKnob,
+    saved: Option<&serde_json::Value>,
+) -> Result<f64, String> {
+    match measure_knobs_at(stimulus, &[(a, 0.0), (b, 0.0)], saved) {
         Ok(l) => Ok(l.integrated_lufs),
         Err(e) if e.contains(NO_SIGNAL_CAPTURED) => Ok(MUTE_FLOOR_SILENT_LUFS),
         Err(e) => Err(e),
@@ -3487,18 +4105,23 @@ pub fn mute_floor_report(
     cur_b: f32,
     stimulus: &[f32],
 ) -> Result<String, String> {
+    // Before the load: the field-8 read this diagnostic's scene writes need (see
+    // `saved_for_scene_knobs`) — `read_saved_preset` sleeps after itself, so the load
+    // session that follows still gets a spaced boundary.
+    let saved = saved_for_scene_knobs(slot, [a, b]);
+    let saved = saved.as_ref();
     {
         let mut s = Session::connect_lean()?;
         s.load_preset(slot)?;
         std::thread::sleep(Duration::from_millis(settle_after_load_ms()));
     }
-    let combined = measure_knobs_at(stimulus, &[(a, cur_a), (b, cur_b)])?;
+    let combined = measure_knobs_at(stimulus, &[(a, cur_a), (b, cur_b)], saved)?;
     std::thread::sleep(Duration::from_millis(RECONNECT_GAP_MS));
-    let floor_lufs = measure_mute_floor(stimulus, a, b)?;
+    let floor_lufs = measure_mute_floor(stimulus, a, b, saved)?;
     std::thread::sleep(Duration::from_millis(RECONNECT_GAP_MS));
-    let a_solo = measure_knobs_at(stimulus, &[(a, cur_a), (b, 0.0)])?;
+    let a_solo = measure_knobs_at(stimulus, &[(a, cur_a), (b, 0.0)], saved)?;
     std::thread::sleep(Duration::from_millis(RECONNECT_GAP_MS));
-    let b_solo = measure_knobs_at(stimulus, &[(a, 0.0), (b, cur_b)])?;
+    let b_solo = measure_knobs_at(stimulus, &[(a, 0.0), (b, cur_b)], saved)?;
     let _ = Session::connect_lean().and_then(|mut s| s.set_reamp_mode(false).map(|_| ()));
 
     let silent = floor_lufs <= MUTE_FLOOR_SILENT_LUFS + 1e-6;
@@ -3558,12 +4181,14 @@ fn balanced_solo_levels(c_a: f64, c_b: f64) -> (f32, f32) {
 /// `probe --mute-floor` correctly refuses a single-amp split-output preset ("needs a 2-amp
 /// merged parallel scene") — the leveller itself falls back to `jointk_one_scene` there.
 /// Restores via preset reload on no-save; ends with a guaranteed re-amp OFF.
+#[allow(clippy::too_many_arguments)]
 pub fn level_scenes_rebalance(
     slot: u32,
     jobs: &[SceneJob],
     stimulus: &[f32],
     save: bool,
     restore_scene: Option<u32>,
+    saved: Option<&serde_json::Value>,
     on_scene: impl FnMut(u32, Option<&BatchedSceneOutcome>),
     cancelled: impl FnMut() -> bool,
 ) -> Result<Vec<BatchedSceneOutcome>, String> {
@@ -3578,11 +4203,11 @@ pub fn level_scenes_rebalance(
             let eff_target = job.target_lufs;
             // Non-mergeable scenes: plain joint-k (nothing to rebalance), self-correcting.
             if !job.rebalanceable || job.knobs.len() < 2 {
-                jointk_one_scene(slot, job, stimulus, eff_target, save, true)
+                jointk_one_scene(slot, job, stimulus, eff_target, save, true, saved)
             } else {
                 // Rebalanceable: 2-lane equalize → joint-k. (Only the first two knobs are the
                 // rebalance pair; the classifier never produces >2 for a single split.)
-                rebalance_one_scene(slot, job, stimulus, eff_target, save, true)
+                rebalance_one_scene(slot, job, stimulus, eff_target, save, true, saved)
             }
         },
     );
@@ -3592,6 +4217,7 @@ pub fn level_scenes_rebalance(
 /// The rebalance flow for ONE mergeable scene: equalize the two lanes' solo loudness, then
 /// joint-k the balanced pair to target. Returns a [`SceneSolve`] like `jointk_one_scene`,
 /// plus a `verify_by_ear` flag when the lane-mute floor is too shallow to trust the balance.
+#[allow(clippy::too_many_arguments)]
 fn rebalance_one_scene(
     slot: u32,
     job: &SceneJob,
@@ -3599,6 +4225,7 @@ fn rebalance_one_scene(
     target_lufs: f64,
     defer: bool,
     verify: bool,
+    saved: Option<&serde_json::Value>,
 ) -> Result<SceneSolve, String> {
     let a = &job.knobs[0];
     let b = &job.knobs[1];
@@ -3609,12 +4236,12 @@ fn rebalance_one_scene(
     // Solo captures feed the per-lane model constants (c_a/c_b) with no verify
     // backstop downstream — floor-guarded like the combined measurement below.
     let la_solo = require_live(
-        || measure_knobs_at(stimulus, &[(&a.knob, cur_a), (&b.knob, 0.0)]),
+        || measure_knobs_at(stimulus, &[(&a.knob, cur_a), (&b.knob, 0.0)], saved),
         stimulus,
     )?;
     std::thread::sleep(Duration::from_millis(RECONNECT_GAP_MS));
     let lb_solo = require_live(
-        || measure_knobs_at(stimulus, &[(&a.knob, 0.0), (&b.knob, cur_b)]),
+        || measure_knobs_at(stimulus, &[(&a.knob, 0.0), (&b.knob, cur_b)], saved),
         stimulus,
     )?;
     std::thread::sleep(Duration::from_millis(RECONNECT_GAP_MS));
@@ -3626,7 +4253,7 @@ fn rebalance_one_scene(
     // If so, the equal-solo balance is only approximate (the combined joint-k still hits the
     // overall target) → flag the scene "verify by ear". One extra capture; rebalance is opt-in.
     // A SILENT floor (deep mute) is the best case → huge margin → no flag.
-    let floor_lufs = measure_mute_floor(stimulus, &a.knob, &b.knob)?;
+    let floor_lufs = measure_mute_floor(stimulus, &a.knob, &b.knob, saved)?;
     std::thread::sleep(Duration::from_millis(RECONNECT_GAP_MS));
     let min_solo = la_solo.integrated_lufs.min(lb_solo.integrated_lufs);
     let verify_by_ear = (min_solo - floor_lufs) < REBALANCE_BLEED_MARGIN_DB;
@@ -3638,7 +4265,7 @@ fn rebalance_one_scene(
     // Floor-guarded: both lanes live at balanced levels must produce a lively capture
     // (the DELIBERATE floor measurement above is measure_mute_floor — never guarded).
     let combined = require_live(
-        || measure_knobs_at(stimulus, &[(&a.knob, la_bal), (&b.knob, lb_bal)]),
+        || measure_knobs_at(stimulus, &[(&a.knob, la_bal), (&b.knob, lb_bal)], saved),
         stimulus,
     )?;
     std::thread::sleep(Duration::from_millis(RECONNECT_GAP_MS));
@@ -3676,17 +4303,16 @@ fn rebalance_one_scene(
     };
     let knob_refs = [&a.knob, &b.knob];
     let base = [la_bal, lb_bal];
-    let repair_refs = job.repair_refs();
     let expected_db = 20.0 * k_eff.max(1e-9).log10();
     let (v0, retry_writes) = apply_first_verified(
         slot,
         stimulus,
         &knob_refs,
         &levels,
-        &repair_refs,
         opts,
         expected_db,
         combined.integrated_lufs,
+        saved,
     )?;
     let (best_lufs, best_levels, clamp_reason, corr_writes) = match v0 {
         Some(v0) if verify => {
@@ -3700,7 +4326,7 @@ fn rebalance_one_scene(
                 v0,
                 target_lufs,
                 defer,
-                &repair_refs,
+                saved,
             )?;
             (c.lufs, c.levels, c.clamp_reason, c.writes)
         }
@@ -3746,6 +4372,7 @@ fn solved_scene_outcome(
         dynamic_spread_lu: Some(s.spread),
         clamp_reason: s.clamp_reason,
         verify_by_ear: s.verify_by_ear,
+        persist_mismatch: None,
     }
 }
 
@@ -3769,6 +4396,7 @@ fn failed_scene_outcome(
         dynamic_spread_lu: None,
         clamp_reason: None,
         verify_by_ear: false,
+        persist_mismatch: None,
     }
 }
 
@@ -3797,6 +4425,11 @@ pub fn level_preset_block(
         if hi <= lo {
             return Err(format!("invalid knob bounds [{lo}, {hi}]"));
         }
+        // ONE field-8 read up front for a SCENE knob — every measure and the final apply
+        // write through `set_knobs`, whose Scene Edit decision needs it (see
+        // `saved_for_scene_knobs`). Read before the load session, never per capture.
+        let overlays = saved_for_scene_knobs(slot, [knob]);
+        let overlays = overlays.as_ref();
         // Load the preset in its own connection (the set-after-load-in-same-conn
         // override applies to any setter, so isolate the load).
         {
@@ -3844,7 +4477,7 @@ pub fn level_preset_block(
         // iteration, and a persistent mid-loop floor lands on the secant's
         // flat-response / no-authority backstops instead of a wrong write.
         let first = require_live(
-            || measure_knob_at(stimulus, knob, from_c(ca), &[]),
+            || measure_knob_at(stimulus, knob, from_c(ca), &[], overlays),
             stimulus,
         )?;
         let dynamic_spread_lu = first.spread_lu();
@@ -3853,7 +4486,7 @@ pub fn level_preset_block(
             return Err(CANCELLED.to_string());
         }
         std::thread::sleep(Duration::from_millis(RECONNECT_GAP_MS));
-        let mut yb = measure_knob_at(stimulus, knob, from_c(cb), &[])?.integrated_lufs;
+        let mut yb = measure_knob_at(stimulus, knob, from_c(cb), &[], overlays)?.integrated_lufs;
         let mut iterations = 2u32;
 
         // Track the best (closest-to-target) measured point as the result.
@@ -3877,7 +4510,8 @@ pub fn level_preset_block(
                 return Err(CANCELLED.to_string());
             }
             std::thread::sleep(Duration::from_millis(RECONNECT_GAP_MS));
-            let ynext = measure_knob_at(stimulus, knob, from_c(cnext), &[])?.integrated_lufs;
+            let ynext =
+                measure_knob_at(stimulus, knob, from_c(cnext), &[], overlays)?.integrated_lufs;
             iterations += 1;
             if (ynext - target_lufs).abs() < (best.1 - target_lufs).abs() {
                 best = (cnext, ynext);
@@ -3898,7 +4532,14 @@ pub fn level_preset_block(
         if cancelled() {
             return Err(CANCELLED.to_string());
         }
-        let (saved, verify_lufs) = apply_level(slot, stimulus, knob, final_level, opts, false)?;
+        let (saved, verify_lufs) = apply_levels(
+            slot,
+            stimulus,
+            &[(knob, final_level)],
+            opts,
+            false,
+            overlays,
+        )?;
 
         Ok(LevelResult {
             slot,
@@ -3917,9 +4558,77 @@ pub fn level_preset_block(
             verify_by_ear: false,
             previous_level: None,
             true_peak_dbtp: None,
+            persist_mismatch: None,
         })
     })();
     restore_after_unsaved_error(slot, opts.save, result)
+}
+
+#[cfg(test)]
+mod persist_verify_tests {
+    use super::*;
+
+    // Base graph carrying one amp at outputLevel 0.40, plus a scene 0 overlay that holds
+    // 0.72 for the same node — the shape a batch-end save leaves behind.
+    fn saved_preset() -> serde_json::Value {
+        serde_json::json!({
+            "audioGraph": { "guitarNodes": {
+                "G1": [ { "nodeId": "amp", "FenderId": "amp",
+                          "dspUnitParameters": { "bypass": false, "outputLevel": 0.40 } } ]
+            } },
+            "scenes": [
+                { "guitarNodes": { "G1": { "amp": { "dspUnitParameters": { "outputLevel": 0.72 } } } } },
+                { "guitarNodes": { "G1": {} } }
+            ]
+        })
+    }
+
+    fn write(scene_slot: u32, value: f32) -> PersistedWrite {
+        PersistedWrite {
+            scene_slot,
+            node_id: "amp".to_string(),
+            parameter_id: "outputLevel".to_string(),
+            value,
+        }
+    }
+
+    // The gate this exists for: a report must never show numbers the save did not persist.
+    #[test]
+    fn persist_mismatches_flags_only_the_scenes_the_save_did_not_keep() {
+        let saved = saved_preset();
+
+        // Solved == persisted, in the scene overlay and at base: nothing to flag.
+        assert!(persist_mismatches(&saved, &[write(0, 0.72)]).is_empty());
+        assert!(
+            persist_mismatches(&saved, &[write(crate::session::BASE_SCENE_SLOT, 0.40)]).is_empty()
+        );
+
+        // The wipe case: the overlay holds a DIFFERENT value than the run solved.
+        let miss = persist_mismatches(&saved, &[write(0, 0.55)]);
+        assert_eq!(
+            miss.len(),
+            1,
+            "the divergent scene must be flagged: {miss:?}"
+        );
+        assert_eq!(miss[0].0, 0);
+
+        // A base write compared against the base graph, same divergence.
+        assert_eq!(
+            persist_mismatches(&saved, &[write(crate::session::BASE_SCENE_SLOT, 0.55)]).len(),
+            1
+        );
+
+        // Scene 1 has no overlay for the node at all — the write is simply not there, which
+        // is a miss, not an "unknown" to be waved through.
+        let miss = persist_mismatches(&saved, &[write(1, 0.61)]);
+        assert_eq!(miss.len(), 1, "an absent overlay is a miss: {miss:?}");
+        assert_eq!(miss[0].0, 1);
+
+        // Only the divergent write is reported when a batch mixes both.
+        let mixed = persist_mismatches(&saved, &[write(0, 0.72), write(1, 0.61)]);
+        assert_eq!(mixed.len(), 1);
+        assert_eq!(mixed[0].0, 1);
+    }
 }
 
 #[cfg(test)]
@@ -3984,6 +4693,9 @@ mod floor_guard_tests {
     fn guarded_measure_retries_once_then_reports_still_flat() {
         let lively = loud(-30.0, 5.0);
         let flat = loud(-30.18, 0.01);
+        // The stimulus spread must exceed the capture's: a chain only compresses, so a
+        // livelier-out-than-in fixture is the aberrant case the spread tell retries.
+        let stim = 6.0;
 
         // First capture lively → no retry.
         let mut calls = 0;
@@ -3992,7 +4704,7 @@ mod floor_guard_tests {
                 calls += 1;
                 Ok(lively)
             },
-            1.5,
+            stim,
             Duration::ZERO,
         )
         .unwrap();
@@ -4006,7 +4718,7 @@ mod floor_guard_tests {
                 calls += 1;
                 Ok(if calls == 1 { flat } else { lively })
             },
-            1.5,
+            stim,
             Duration::ZERO,
         )
         .unwrap();
@@ -4020,7 +4732,7 @@ mod floor_guard_tests {
                 calls += 1;
                 Ok(flat)
             },
-            1.5,
+            stim,
             Duration::ZERO,
         )
         .unwrap();
@@ -4040,6 +4752,94 @@ mod floor_guard_tests {
         .unwrap();
         assert!(matches!(out, GuardOutcome::Live(_)));
         assert_eq!(calls, 1);
+    }
+
+    // A capture cannot be MORE dynamic than the stimulus that drove it — a chain only
+    // compresses. More spread out than in means the capture is not the sound we asked
+    // for (a partially-landed recall). Armed by the same stationary-stimulus gate as
+    // `floor_suspect`, so a disarmed stimulus disarms both.
+    #[test]
+    fn spread_aberrant_trips_only_above_the_stimulus_with_a_lively_stimulus() {
+        assert!(spread_aberrant(9.0, 6.0)); // more dynamic out than in — impossible
+        assert!(!spread_aberrant(6.0, 6.0)); // equal: the pass-through limit
+        assert!(!spread_aberrant(5.0, 6.0)); // compressed: the normal case
+        assert!(!spread_aberrant(6.0 + SPREAD_ABERRANT_MARGIN_LU, 6.0)); // margin is inclusive
+        assert!(!spread_aberrant(9.0, 0.2)); // stationary stimulus disarms the trip
+    }
+
+    // The spread tell buys exactly ONE re-measure and then reports whatever it got:
+    // unlike a floor read, an aberrant-spread capture is a plausible number, so it is
+    // never escalated to an error (and never to StillFlat, whose level-shift confirm a
+    // wrong-scene capture would pass — presetLevel is linear whatever scene landed).
+    #[test]
+    fn guarded_measure_retries_once_on_aberrant_spread() {
+        let stim = 6.0;
+        let aberrant = loud(-30.0, 9.0);
+        let compressed = loud(-24.0, 5.0);
+
+        // Aberrant then compressed → the SECOND reading is returned, two calls.
+        let mut calls = 0;
+        let out = measure_floor_guarded(
+            || {
+                calls += 1;
+                Ok(if calls == 1 { aberrant } else { compressed })
+            },
+            stim,
+            Duration::ZERO,
+        )
+        .unwrap();
+        match out {
+            GuardOutcome::Live(l) => assert!((l.integrated_lufs - -24.0).abs() < 1e-9),
+            GuardOutcome::StillFlat(_) => panic!("an aberrant capture must never escalate"),
+        }
+        assert_eq!(calls, 2);
+
+        // Persistently aberrant → still Live (best effort), still exactly one retry.
+        let mut calls = 0;
+        let out = measure_floor_guarded(
+            || {
+                calls += 1;
+                Ok(aberrant)
+            },
+            stim,
+            Duration::ZERO,
+        )
+        .unwrap();
+        assert!(matches!(out, GuardOutcome::Live(_)));
+        assert_eq!(calls, 2);
+
+        // A compressed capture is the normal case — no retry at all.
+        let mut calls = 0;
+        let out = measure_floor_guarded(
+            || {
+                calls += 1;
+                Ok(compressed)
+            },
+            stim,
+            Duration::ZERO,
+        )
+        .unwrap();
+        assert!(matches!(out, GuardOutcome::Live(_)));
+        assert_eq!(calls, 1);
+
+        // The retry can land on a FLOOR read — that must still be reported as flat,
+        // not laundered into a Live reading by the spread lane.
+        let mut calls = 0;
+        let out = measure_floor_guarded(
+            || {
+                calls += 1;
+                Ok(if calls == 1 {
+                    aberrant
+                } else {
+                    loud(-30.18, 0.01)
+                })
+            },
+            stim,
+            Duration::ZERO,
+        )
+        .unwrap();
+        assert!(matches!(out, GuardOutcome::StillFlat(_)));
+        assert_eq!(calls, 2);
     }
 }
 
@@ -4844,7 +5644,7 @@ mod tests {
     // (A3) A base block knob write must recall base explicitly — a preset loads
     // into its saved lastLoadedScene, not necessarily base (HW), so a bare write
     // with no recall would silently land wherever that saved scene left it. This
-    // is the reported bug's exact shape: preset 28 ("JFF LP  Hiwatt 3 scenes")
+    // is the reported bug's exact shape: preset 28 (the e2e `E2E Hiwatt 3S` fixture)
     // has `lastLoadedScene = 3`, and scene 3 is literally named "Base Scene" —
     // the naming collision that made the symptom read as "leveling wrote into
     // the base preset" when it actually wrote into scene 3's overlay. The
@@ -4861,7 +5661,7 @@ mod tests {
             parameter_id: "outputLevel".into(),
             scene_slot: None,
         };
-        set_knob(&mut s, &knob, 0.6).expect("set_knob");
+        set_knob(&mut s, &knob, 0.6, None).expect("set_knob");
         let ev = sim.events();
         assert!(
             ev.iter().any(|e| matches!(
@@ -4892,7 +5692,7 @@ mod tests {
             scene_slot: Some(scene),
         };
         let (a, b) = (mk(1), mk(2));
-        let err = set_knobs(&mut s, &[(&a, 0.6), (&b, 0.4)])
+        let err = set_knobs(&mut s, &[(&a, 0.6), (&b, 0.4)], None)
             .expect_err("a batch mixing scenes 1 and 2 must be refused, not silently merged");
         assert!(
             err.contains("mixes scenes"),
@@ -4921,7 +5721,7 @@ mod tests {
             scene_slot: scene,
         };
         let (base, scened) = (mk(None), mk(Some(2)));
-        let err = set_knobs(&mut s, &[(&base, 0.6), (&scened, 0.4)])
+        let err = set_knobs(&mut s, &[(&base, 0.6), (&scened, 0.4)], None)
             .expect_err("a batch mixing a base target with a scene target must be refused");
         assert!(
             err.contains("mixes base and scene"),
@@ -4947,7 +5747,7 @@ mod tests {
             parameter_id: "outputLevel".into(),
             scene_slot: None,
         };
-        set_knobs(&mut s, &[(&knob, 0.6)]).expect("set_knobs");
+        set_knobs(&mut s, &[(&knob, 0.6)], None).expect("set_knobs");
         let ev = sim.events();
         assert!(
             ev.iter().any(|e| matches!(
@@ -4970,12 +5770,61 @@ mod tests {
         let sim = crate::sim_device::SimDevice::new().with_saved_scene(30, Some(3));
         let mut s = Session::from_transport(Box::new(sim.clone()));
         s.load_preset(30).expect("load_preset");
-        set_knobs(&mut s, &[(&LevelKnob::PresetLevel, 0.5)]).expect("set_knobs");
+        set_knobs(&mut s, &[(&LevelKnob::PresetLevel, 0.5)], None).expect("set_knobs");
         let ev = sim.events();
         assert!(
             !ev.iter()
                 .any(|e| matches!(e, crate::sim_device::SimEvent::LoadScene(_))),
             "a PresetLevel-only batch must not recall any scene: {ev:?}"
+        );
+    }
+
+    // The pre-save recall reverts an UNSAVED `presetLevel` to the saved value (the
+    // load-level-apply gotcha), so every recalling save must replay it between the
+    // recall and the save — the exact op order is the invariant (HW: a solved
+    // 0.3096 "[SAVED]" persisted the prior 0.32 until this re-assert existed;
+    // caught live by the online level-rerun base idempotency spec).
+    #[test]
+    fn recall_reassert_save_replays_the_unsaved_level_after_the_recall() {
+        let sim = crate::sim_device::SimDevice::new().with_saved_scene(30, Some(3));
+        let mut s = Session::from_transport(Box::new(sim.clone()));
+        s.load_preset(30).expect("load_preset");
+        recall_reassert_save(&mut s, 30, Some(3), Some(0.42)).expect("save");
+        let tail: Vec<String> = sim
+            .events()
+            .iter()
+            .filter_map(|e| match e {
+                crate::sim_device::SimEvent::LoadScene(n) => Some(format!("scene{n}")),
+                crate::sim_device::SimEvent::PresetLevel(v) => Some(format!("level{v}")),
+                crate::sim_device::SimEvent::Saved(n) => Some(format!("save{n}")),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            tail,
+            vec!["scene3", "level0.42", "save30"],
+            "order must be recall → re-assert → save"
+        );
+    }
+
+    // Without a recall there is nothing to revert — the re-assert must NOT fire
+    // (an unconditional extra write would be a behavior change for plain saves).
+    #[test]
+    fn recall_reassert_save_skips_the_reassert_without_a_recall() {
+        let sim = crate::sim_device::SimDevice::new();
+        let mut s = Session::from_transport(Box::new(sim.clone()));
+        s.load_preset(30).expect("load_preset");
+        recall_reassert_save(&mut s, 30, None, Some(0.42)).expect("save");
+        let ev = sim.events();
+        assert!(
+            !ev.iter()
+                .any(|e| matches!(e, crate::sim_device::SimEvent::PresetLevel(_))),
+            "no recall → no re-assert: {ev:?}"
+        );
+        assert!(
+            ev.iter()
+                .any(|e| matches!(e, crate::sim_device::SimEvent::Saved(30))),
+            "the save itself must still land: {ev:?}"
         );
     }
 
@@ -5003,7 +5852,7 @@ mod tests {
                 value: 0.7,
             },
         ];
-        write_grouped_knobs(&mut s, &knobs).expect("write_grouped_knobs");
+        write_grouped_knobs(&mut s, &knobs, None).expect("write_grouped_knobs");
         let ev = sim.events();
         let base_recalls = ev
             .iter()
@@ -5023,107 +5872,430 @@ mod tests {
         ));
     }
 
-    // B1: `SetNodeSceneEdit(node, true)` reseeds a node's ENTIRE scene overlay from base
-    // (HW 3-cell isolation matrix, `probe_api/slot_write.rs`), so leveling ONE param on a
-    // node must not silently wipe another already-scene-edited param on the SAME node. A
-    // `SceneJob::repair` entry riding alongside the leveled knob in the same `set_knobs`
-    // batch is the fix — it lands AFTER the (deduped) enable, same as the leveled knob.
-    #[test]
-    fn set_knobs_repair_entry_survives_the_scene_edit_reseed() {
-        let sim = crate::sim_device::SimDevice::new();
-        let mut s = Session::from_transport(Box::new(sim.clone()));
-        s.load_preset(0).expect("load_preset");
-        // Base gain = 0.7; scene 2 already carries its own scene-edited gain = 0.4.
-        s.load_scene(crate::session::BASE_SCENE_SLOT)
-            .expect("recall base");
-        s.change_parameter("G1", "amp", "gain", 0.7)
-            .expect("write base gain");
-        s.load_scene(2).expect("recall scene 2");
-        s.set_node_scene_edit("G1", "amp", true)
-            .expect("enable scene edit");
-        s.change_parameter("G1", "amp", "gain", 0.4)
-            .expect("write scene gain");
-
-        // Level a DIFFERENT param on the SAME node in scene 2 — the write that would
-        // normally re-enable Scene Edit and reseed "gain" back to base's 0.7 — paired
-        // with a repair entry for "gain" so it survives at 0.4.
-        let level_knob = LevelKnob::Block {
-            group_id: "G1".into(),
-            node_id: "amp".into(),
-            parameter_id: "outputLevel".into(),
-            scene_slot: Some(2),
-        };
-        let repair_knob = LevelKnob::Block {
-            group_id: "G1".into(),
-            node_id: "amp".into(),
-            parameter_id: "gain".into(),
-            scene_slot: Some(2),
-        };
-        set_knobs(&mut s, &[(&level_knob, 0.9), (&repair_knob, 0.4)]).expect("set_knobs");
-
-        let ev = sim.events();
-        let last_gain = ev.iter().rev().find_map(|e| match e {
-            crate::sim_device::SimEvent::ChangeParameter {
-                scene: 2,
-                group,
-                node,
-                param,
-                value,
-            } if group == "G1" && node == "amp" && param == "gain" => Some(*value),
-            _ => None,
+    /// Saved (field-8) preset for the Scene Edit tests: one amp node in G1, base
+    /// `outputLevel`/`gain`, and — when `overlay` — a scene-0 overlay for that node.
+    fn saved_with_overlay(overlay: bool) -> serde_json::Value {
+        let mut p = serde_json::json!({
+            "lastLoadedScene": 3,
+            "audioGraph": { "template": "gtrSeries", "guitarNodes": { "G1": [
+                { "nodeId": "amp", "FenderId": "ACD_Twin57",
+                  "dspUnitParameters": { "bypass": false, "outputLevel": 0.5, "gain": 0.7 } }
+            ] } },
+            "scenes": [{ "sceneName": "Lead" }]
         });
-        assert_eq!(
-            last_gain,
-            Some(0.4),
-            "the repair entry must survive the scene-edit reseed, not revert to base's 0.7: {ev:?}"
-        );
+        if overlay {
+            p["scenes"][0]["guitarNodes"] = serde_json::json!({
+                "G1": { "amp": { "dspUnitParameters": { "outputLevel": 0.4, "gain": 0.3 } } }
+            });
+        }
+        p
     }
 
-    // Two repair entries on the SAME node must not each re-enable Scene Edit — that would
-    // itself re-trigger the reseed inside the very batch meant to repair it.
+    fn scene_knob(param: &str) -> LevelKnob {
+        LevelKnob::Block {
+            group_id: "G1".into(),
+            node_id: "amp".into(),
+            parameter_id: param.into(),
+            scene_slot: Some(0),
+        }
+    }
+
+    // B1: `SetNodeSceneEdit(node, true)` RESEEDS the node's scene overlay from base (HW
+    // 3-cell matrix, `probe_api/slot_write.rs`), so a scene that ALREADY has an overlay for
+    // the node must be written with the enable DROPPED — the write lands on the overlay
+    // regardless, and the enable would wipe the scene's other stored params (the reported
+    // corruption: scene tone params reseeded to base while the leveled value survived).
     #[test]
-    fn set_knobs_dedupes_scene_edit_enable_across_repair_targets_on_one_node() {
+    fn set_knobs_omits_the_scene_edit_enable_when_the_overlay_exists() {
         let sim = crate::sim_device::SimDevice::new();
         let mut s = Session::from_transport(Box::new(sim.clone()));
         s.load_preset(0).expect("load_preset");
-        let level_knob = LevelKnob::Block {
-            group_id: "G1".into(),
-            node_id: "amp".into(),
-            parameter_id: "outputLevel".into(),
-            scene_slot: Some(2),
-        };
-        let gain_knob = LevelKnob::Block {
-            group_id: "G1".into(),
-            node_id: "amp".into(),
-            parameter_id: "gain".into(),
-            scene_slot: Some(2),
-        };
-        let tone_knob = LevelKnob::Block {
-            group_id: "G1".into(),
-            node_id: "amp".into(),
-            parameter_id: "tone".into(),
-            scene_slot: Some(2),
-        };
-        set_knobs(
-            &mut s,
-            &[(&level_knob, 0.9), (&gain_knob, 0.4), (&tone_knob, 0.5)],
-        )
-        .expect("set_knobs");
-        let ev = sim.events();
-        let enables = ev
+        // Base gain 0.7; scene 0 already carries its own gain 0.3 (what the reseed wipes).
+        s.load_scene(crate::session::BASE_SCENE_SLOT).expect("base");
+        s.change_parameter("G1", "amp", "gain", 0.7)
+            .expect("base gain");
+        s.load_scene(0).expect("scene 0");
+        s.set_node_scene_edit("G1", "amp", true)
+            .expect("seed overlay");
+        s.change_parameter("G1", "amp", "gain", 0.3)
+            .expect("scene gain");
+
+        let knob = scene_knob("outputLevel");
+        let saved = saved_with_overlay(true);
+        set_knobs(&mut s, &[(&knob, 0.9)], Some(&saved)).expect("set_knobs");
+
+        let enables = sim
+            .events()
             .iter()
-            .filter(|e| {
-                matches!(e, crate::sim_device::SimEvent::SceneEdit { group, node, enable }
-                    if group == "G1" && node == "amp" && *enable)
-            })
+            .skip_while(|e| !matches!(e, crate::sim_device::SimEvent::ChangeParameter { param, value, .. } if param == "gain" && *value == 0.3))
+            .filter(|e| matches!(e, crate::sim_device::SimEvent::SceneEdit { enable: true, .. }))
             .count();
         assert_eq!(
-            enables, 1,
-            "three targets on ONE node must share a single enable, not one each: {ev:?}"
+            enables,
+            0,
+            "an existing overlay must be written WITHOUT the reseeding enable: {:?}",
+            sim.events()
+        );
+        assert_eq!(
+            sim.param_write(0, "G1", "amp", "gain"),
+            Some(0.3),
+            "the scene's own gain must survive the leveling write, not be reseeded to base's 0.7"
         );
     }
 
-    // A `"bypass"` repair entry (0.0/1.0-encoded) must route through `change_parameter_bool`
+    // The other HW branch: no overlay for the node in that scene → the enable is what
+    // MATERIALISES the overlay, so without it the write LEAKS TO BASE. It must be sent.
+    #[test]
+    fn set_knobs_enables_scene_edit_when_the_overlay_is_absent() {
+        let sim = crate::sim_device::SimDevice::new();
+        let mut s = Session::from_transport(Box::new(sim.clone()));
+        s.load_preset(0).expect("load_preset");
+        let knob = scene_knob("outputLevel");
+        let saved = saved_with_overlay(false);
+        set_knobs(&mut s, &[(&knob, 0.9)], Some(&saved)).expect("set_knobs");
+        assert!(
+            sim.events().iter().any(|e| matches!(
+                e,
+                crate::sim_device::SimEvent::SceneEdit { group, node, enable: true }
+                    if group == "G1" && node == "amp"
+            )),
+            "an absent overlay needs the enable to materialise it: {:?}",
+            sim.events()
+        );
+    }
+
+    // Neither write shape is safe when overlay presence is UNKNOWN (truncated field-8 read)
+    // or no saved doc was read at all — both mistakes corrupt the preset, so refuse before
+    // touching the device rather than guess.
+    #[test]
+    fn set_knobs_refuses_a_scene_write_without_known_overlay_presence() {
+        for (label, saved) in [
+            ("no saved doc", None),
+            // `scenes` truncated away → SceneOverlay::Unknown.
+            (
+                "truncated read",
+                Some(serde_json::json!({ "audioGraph": { "guitarNodes": { "G1": [
+                { "nodeId": "amp", "FenderId": "ACD_Twin57", "dspUnitParameters": {} }] } } })),
+            ),
+        ] {
+            let sim = crate::sim_device::SimDevice::new();
+            let mut s = Session::from_transport(Box::new(sim.clone()));
+            s.load_preset(0).expect("load_preset");
+            let knob = scene_knob("outputLevel");
+            let err = set_knobs(&mut s, &[(&knob, 0.9)], saved.as_ref())
+                .expect_err("a scene write with unknown overlay presence must be refused");
+            assert!(
+                err.contains("overlay"),
+                "{label}: the error must name the overlay-presence cause: {err}"
+            );
+            assert!(
+                !sim.events().iter().any(|e| matches!(
+                    e,
+                    crate::sim_device::SimEvent::ChangeParameter { .. }
+                        | crate::sim_device::SimEvent::SceneEdit { .. }
+                )),
+                "{label}: nothing may be written when the batch is refused: {:?}",
+                sim.events()
+            );
+        }
+    }
+
+    /// A synthetic loudness reading for the injected-capture footswitch tests.
+    fn fs_loud(integrated: f64) -> lufs::Loudness {
+        lufs::Loudness {
+            integrated_lufs: integrated,
+            short_term_max_lufs: integrated + 2.0,
+            true_peak_dbtp: -1.0,
+        }
+    }
+
+    /// FS isolation must be re-sent on EVERY capture, not just the first: each capture
+    /// recalls a scene (base included — `arm_measurement`) and a recall RE-ASSERTS that
+    /// scene's own bypass state, so a once-only forced write leaves captures 2..N measuring
+    /// a NON-isolated sound (the sibling block-acting switch audible again). Two switches:
+    /// the sibling's forced bypass must appear in every call's list.
+    ///
+    /// The injected capture keeps this off the device paths that open a real session
+    /// (`reamp_off`): a plain solve with `current_value: None` and live readings never
+    /// reaches them.
+    #[test]
+    fn solve_footswitch_resends_the_isolation_list_on_every_capture() {
+        let iso = vec![("G1".to_string(), "sibling".to_string(), true)];
+        let seen: std::cell::RefCell<Vec<Vec<(String, String, bool)>>> =
+            std::cell::RefCell::new(Vec::new());
+        // Response with real slope so the secant keeps iterating (target never reached).
+        let r = solve_footswitch(2, &iso, &[], -20.0, "baked", None, |byp, v| {
+            seen.borrow_mut().push(byp.to_vec());
+            Ok(fs_loud(-40.0 + 10.0 * f64::from(v)))
+        })
+        .expect("solve");
+        let calls = seen.borrow();
+        assert!(
+            calls.len() >= 3,
+            "expected a multi-capture solve: {calls:?}"
+        );
+        assert!(
+            calls.iter().all(|got| got == &iso),
+            "every capture must carry the full isolation list, not just the first: {calls:?}"
+        );
+        assert_eq!(r.switch, 2);
+    }
+
+    /// The HW curve that beat the plain secant (Hiwatt fs12, UniVibe `volume` —
+    /// measured points from the strict-harness post-mortem, 3/3 reproducible):
+    /// a steep audio-taper cliff (~90 LU/knob-unit) under a shallow top (~10),
+    /// modeled as the monotone piecewise-linear interpolant of the captures.
+    fn univibe_volume_curve(v: f32) -> f64 {
+        const ANCHORS: [(f64, f64); 8] = [
+            (0.0, -80.0),
+            (0.25, -45.6),
+            (0.3207, -38.0),
+            (0.45, -32.0),
+            (0.6146, -16.94),
+            (0.6758, -16.2),
+            (0.75, -15.5),
+            (1.0, -14.5),
+        ];
+        let v = f64::from(v).clamp(0.0, 1.0);
+        for w in ANCHORS.windows(2) {
+            let ((v0, l0), (v1, l1)) = (w[0], w[1]);
+            if v <= v1 {
+                return l0 + (v - v0) / (v1 - v0) * (l1 - l0);
+            }
+        }
+        ANCHORS[ANCHORS.len() - 1].1
+    }
+
+    /// On the UniVibe cliff the plain sliding secant provably stops ~3 LU hot
+    /// (it did on HW, and the strict e2e re-measure caught the miss); the
+    /// bracket-aware loop must converge inside `KNOB_TOL_LU` — the seed pair
+    /// already straddles the target, so Illinois-damped bracket retention owns
+    /// the endgame instead of the slide.
+    #[test]
+    fn solve_footswitch_bracket_mode_converges_on_the_univibe_cliff() {
+        let mut captures = 0u32;
+        let r = solve_footswitch(12, &[], &[], -20.0, "baked", None, |_, v| {
+            captures += 1;
+            Ok(fs_loud(univibe_volume_curve(v)))
+        })
+        .expect("solve");
+        assert!(
+            (r.predicted_lufs - -20.0).abs() <= KNOB_TOL_LU,
+            "bracket mode must land within KNOB_TOL_LU: best {} LUFS at v={} ({} captures)",
+            r.predicted_lufs,
+            r.final_value,
+            captures
+        );
+        assert!(!r.clamped && !r.unconverged, "converged solve: {r:?}");
+        // Budget sanity: seeds + expansion + bounded correction, never unbounded.
+        assert!(captures <= 3 + FS_CORRECT_MAX, "captures={captures}");
+    }
+
+    // A knob with NO authority over loudness (every capture measures the same
+    // off-target LUFS) is a physical dead end: a re-run repeats the identical miss,
+    // so the verdict must be the reason-less clamp — never "unconverged", whose UI
+    // copy advertises a re-run that cannot help.
+    #[test]
+    fn solve_footswitch_flat_response_reports_clamped_not_unconverged() {
+        let mut captures = 0u32;
+        let r = solve_footswitch(12, &[], &[], -20.0, "baked", None, |_, _| {
+            captures += 1;
+            Ok(fs_loud(-27.0))
+        })
+        .expect("solve");
+        assert!(
+            r.clamped && !r.unconverged,
+            "flat response must clamp, not advertise a re-run: {r:?}"
+        );
+        assert!(captures <= 3 + FS_CORRECT_MAX, "captures={captures}");
+    }
+
+    // The three-state split (was ONE `clamped` flag with `clamp_reason: None` for both the
+    // unreachable and the merely-unconverged case — the UI could only say "clamped", telling
+    // a user to accept a number a re-run would have improved, and telling another to retry
+    // something physically unreachable). Each row must produce a DISTINCT tuple.
+    #[test]
+    fn classify_fs_outcome_splits_a_bound_hit_from_an_exhausted_search() {
+        let target = -20.0;
+        for (label, best_v, best_lufs, want) in [
+            // Knob maxed and target still louder → unreachable.
+            ("maxed, target louder", 1.0, -26.0, (true, false)),
+            // Knob at zero and target still quieter → unreachable.
+            ("zeroed, target quieter", 0.0, -14.0, (true, false)),
+            // Mid-range miss: captures ran out, the knob still has room → re-runnable.
+            ("mid-range miss", 0.55, -26.0, (false, true)),
+            ("mid-range overshoot", 0.55, -14.0, (false, true)),
+            // On target (within KNOB_TOL_LU) → neither, even sitting on a bound.
+            ("on target", 1.0, -20.1, (false, false)),
+            // At a bound but the miss is in the direction the knob CAN still move → the
+            // search simply stopped early, so it is unconverged, not unreachable.
+            ("maxed, target quieter", 1.0, -14.0, (false, true)),
+        ] {
+            assert_eq!(
+                classify_fs_outcome(best_v, best_lufs, target),
+                want,
+                "{label}: v={best_v} lufs={best_lufs}"
+            );
+        }
+    }
+
+    // A `FsWrite::Bake` persists with `changeParameter`, which lands in the connection's
+    // CURRENT scene — and the write session's own `load_preset` activates the preset's saved
+    // `lastLoadedScene`. Without a base recall the solved value went into that scene's
+    // overlay while base (what the leveler measured, and what the switch's off position
+    // renders) kept its old value.
+    #[test]
+    fn write_fs_values_bakes_into_base_not_the_saved_scene() {
+        let sim = crate::sim_device::SimDevice::new().with_saved_scene(30, Some(3));
+        let mut s = Session::from_transport(Box::new(sim.clone()));
+        let pending = vec![FsPendingWrite {
+            switch: 1,
+            lev: (
+                "G1".to_string(),
+                "amp".to_string(),
+                "outputLevel".to_string(),
+            ),
+            write: FsWrite::Bake {
+                clear_stale: None,
+                mirror_scenes: vec![],
+            },
+            value: 0.42,
+        }];
+        write_fs_values_on_session(&mut s, 30, &pending, None).expect("write");
+        let ev = sim.events();
+        let baked: Vec<i64> = ev
+            .iter()
+            .filter_map(|e| match e {
+                crate::sim_device::SimEvent::ChangeParameter { scene, param, .. }
+                    if param == "outputLevel" =>
+                {
+                    Some(*scene)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            baked,
+            vec![crate::sim_device::SCENE_BASE],
+            "the bake must land in BASE, not the saved scene 3: {ev:?}"
+        );
+    }
+
+    // A bake on a device-authored scened preset is MASKED by every full-param scene overlay
+    // (HW, Hiwatt slot 31: the overlays governed the DSP while base stayed untouched), so the
+    // solved value must ALSO be written into each overlay that restated the base value —
+    // after the base write, one recall per mirror scene, then the ORIGINAL `lastLoadedScene`
+    // recalled so the save re-stamps it (HW: the FS save stamped 8 over the user's scene 3).
+    #[test]
+    fn write_fs_values_mirrors_the_bake_and_restores_the_saved_scene() {
+        let sim = crate::sim_device::SimDevice::new().with_saved_scene(30, Some(3));
+        let mut s = Session::from_transport(Box::new(sim.clone()));
+        let pending = vec![FsPendingWrite {
+            switch: 1,
+            lev: (
+                "G1".to_string(),
+                "amp".to_string(),
+                "outputLevel".to_string(),
+            ),
+            write: FsWrite::Bake {
+                clear_stale: None,
+                mirror_scenes: vec![0, 2],
+            },
+            value: 0.42,
+        }];
+        write_fs_values_on_session(&mut s, 30, &pending, Some(3)).expect("write");
+        let ev = sim.events();
+        let writes: Vec<i64> = ev
+            .iter()
+            .filter_map(|e| match e {
+                crate::sim_device::SimEvent::ChangeParameter { scene, param, .. }
+                    if param == "outputLevel" =>
+                {
+                    Some(*scene)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            writes,
+            vec![crate::sim_device::SCENE_BASE, 0, 2],
+            "bake writes base first, then each mirror scene's overlay: {ev:?}"
+        );
+        // The LAST scene recall before the save must be the preset's original scene 3.
+        let last_recall = ev
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                crate::sim_device::SimEvent::LoadScene(scene) => Some(*scene),
+                _ => None,
+            })
+            .expect("a scene recall");
+        assert_eq!(
+            last_recall, 3,
+            "the save must re-stamp the original lastLoadedScene: {ev:?}"
+        );
+    }
+
+    // (A3, presetLevel lane) The reported measurement bug: `measure_c`'s captures set
+    // `presetLevel` with NO scene recall, so on a preset whose saved `lastLoadedScene` is a
+    // FS scene (HW: preset 28, scene 3) the "base" ceiling `C` was measured in that scene —
+    // a different sound than the one being leveled. Base is a recall (wire slot 8), never an
+    // omission.
+    #[test]
+    fn arm_measurement_recalls_base_before_a_preset_level_capture() {
+        let sim = crate::sim_device::SimDevice::new().with_saved_scene(30, Some(3));
+        let mut s = Session::from_transport(Box::new(sim.clone()));
+        s.load_preset(30).expect("load_preset"); // activates saved scene 3, not base
+        arm_measurement(&mut s, &LevelKnob::PresetLevel, 0.5, &[], None).expect("arm");
+        let ev = sim.events();
+        let recall = ev.iter().position(|e| {
+            matches!(e, crate::sim_device::SimEvent::LoadScene(sc) if *sc == crate::session::BASE_SCENE_SLOT)
+        });
+        let set = ev
+            .iter()
+            .position(|e| matches!(e, crate::sim_device::SimEvent::PresetLevel(_)));
+        assert!(
+            recall.is_some() && recall < set,
+            "the base recall must precede the presetLevel write: {ev:?}"
+        );
+    }
+
+    // Isolation LAST: `load_scene` re-asserts the scene's own bypass state, so a forced
+    // bypass written BEFORE the recall is silently reverted and the capture measures a
+    // non-isolated sound. Every recall-bearing capture re-sends the full list after it.
+    #[test]
+    fn arm_measurement_writes_isolation_bypasses_after_the_scene_recall() {
+        let sim = crate::sim_device::SimDevice::new().with_saved_scene(30, Some(3));
+        let mut s = Session::from_transport(Box::new(sim.clone()));
+        s.load_preset(30).expect("load_preset");
+        let knob = LevelKnob::Block {
+            group_id: "G1".into(),
+            node_id: "amp".into(),
+            parameter_id: "outputLevel".into(),
+            scene_slot: None,
+        };
+        arm_measurement(
+            &mut s,
+            &knob,
+            0.6,
+            &[("G1".to_string(), "fx".to_string(), true)],
+            None,
+        )
+        .expect("arm");
+        let ev = sim.events();
+        let recall = ev
+            .iter()
+            .rposition(|e| matches!(e, crate::sim_device::SimEvent::LoadScene(_)));
+        let bypass = ev.iter().position(
+            |e| matches!(e, crate::sim_device::SimEvent::Bypass { node, on } if node == "fx" && *on),
+        );
+        assert!(
+            bypass.is_some() && recall < bypass,
+            "the isolation bypass must be written AFTER the last scene recall: {ev:?}"
+        );
+    }
+
+    // A `"bypass"` knob value (0.0/1.0-encoded) must route through `change_parameter_bool`
     // — the WIRE message is different (`ChangeParameter.boolVal`, field 7) from every other
     // block param, so smuggling it through the float `change_parameter` call would set the
     // wrong field and silently fail to write bypass at all.
@@ -5138,11 +6310,11 @@ mod tests {
             parameter_id: "bypass".into(),
             scene_slot: None,
         };
-        set_knob(&mut s, &bypass_knob, 1.0).expect("set_knob");
+        set_knob(&mut s, &bypass_knob, 1.0, None).expect("set_knob");
         assert_eq!(
             sim.bypass_write("amp"),
             Some(true),
-            "a bypass repair value must land as a BOOL write, not a float dspUnitParameters one"
+            "a bypass knob value must land as a BOOL write, not a float dspUnitParameters one"
         );
     }
 }

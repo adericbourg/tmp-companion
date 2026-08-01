@@ -123,6 +123,9 @@ interface LevelOutcomeFields {
   predicted_lufs: number;
   dynamic_spread_lu: number | null;
   verify_by_ear?: boolean;
+  /** Footswitch rows only — `LevelResult` (preset/scene) has no such field, so it stays
+   *  optional and those lanes simply never report an unconverged row. */
+  unconverged?: boolean;
 }
 
 // A `clamp_reason` is set ONLY when the leveled signal isn't effectively reaching the USB 1/2
@@ -130,9 +133,17 @@ interface LevelOutcomeFields {
 // scene path's no-authority case (a big amp-outputLevel change doesn't move the capture:
 // off-branch) → its own `offbranch` outcome ("not on USB 1/2"), which a re-level can't fix.
 // A plain headroom/authority clamp (the knob has real effect but can't reach target) has
-// `clamped` set with NO reason → "clamped at X".
+// `clamped` set with NO reason → "clamped at X". `unconverged` is last of the miss states
+// (the backend's own precedence): it is only ever set when `clamped` is not, and it means
+// the knob had room left, so a re-run helps.
 const outcomeOf = (r: LevelOutcomeFields): RunItem["outcome"] =>
-  r.clamp_reason != null ? "offbranch" : r.clamped ? "clamped" : "done";
+  r.clamp_reason != null
+    ? "offbranch"
+    : r.clamped
+      ? "clamped"
+      : r.unconverged
+        ? "unconverged"
+        : "done";
 const valueOf = (r: LevelOutcomeFields): number =>
   r.verify_lufs ?? r.predicted_lufs;
 // Resolve to a SINGLE by-ear cause. If a row is both dynamic AND rebalance-uncertain (rare —
@@ -382,8 +393,33 @@ export function useLevelingFlow({
             finishItem(entry.item, entry.idx);
           }
         };
+      // A batched call (scene / footswitch) does ~8 s of un-streamed setup — the field-8
+      // read, the preset load and their HID gaps — before the backend's first `active`
+      // item arrives. Until then no row is active, so the run table reads "queued" for
+      // every row and the header meter stays hidden: a dead-looking wizard. Flip the
+      // group's first row active up front (the same thing the Base lane does before its
+      // own await); the channel's own `active` items then take over per row.
+      // `idx` is the group's own start index (the caller's loop counter), NOT re-derived
+      // from the map: a Map keyed on scene slot returns its values in first-KEY order, so a
+      // derived index could disagree with the one the channel publishes moments later and
+      // make the step counter jump backward.
+      const markGroupActive = <K>(entries: Map<K, BatchEntry>, idx: number) => {
+        const rows = [...entries.values()];
+        if (rows.length === 0) return;
+        rows[0].item.status = "active";
+        publish(idx, false, false);
+      };
       const sweepUnresolved = <K>(entries: Map<K, BatchEntry>) => {
-        if (isCancelled()) return;
+        if (isCancelled()) {
+          // A cancelled batch keeps un-run rows queued (still selected for a
+          // follow-up run), but the optimistic `markGroupActive` row never got a
+          // backend result — revert it or it spins "stopping…" forever on the
+          // finished run (the final done publish picks this mutation up).
+          for (const entry of entries.values()) {
+            if (entry.item.status === "active") entry.item.status = "queued";
+          }
+          return;
+        }
         for (const entry of entries.values()) {
           if (entry.item.status !== "result") {
             entry.item.outcome = "skipped";
@@ -467,6 +503,7 @@ export function useLevelingFlow({
             ),
           );
           const resolveFs = batchResolve(bySwitch, causeOf);
+          markGroupActive(bySwitch, i);
           try {
             await levelFootswitchesApply(
               {
@@ -480,6 +517,10 @@ export function useLevelingFlow({
                           levNodeId: g.footswitch.levNodeId,
                           levParameterId: g.footswitch.levParameterId,
                           targetLufs: targetOf(g),
+                          // The row name IS the switch's current display label
+                          // (`footswitchName`) — sent so the backend can keep it when
+                          // an assign adds a second function to an unlabelled switch.
+                          displayLabel: g.sceneName,
                         },
                       ]
                     : [],
@@ -542,6 +583,7 @@ export function useLevelingFlow({
           group.map((g, k) => [g.sceneSlot, { item: g, idx: i + k }]),
         );
         const resolveScene = batchResolve(byScene, causeOf);
+        markGroupActive(byScene, i);
         // ponytail: per-scene outcomes arrive via the Channel (`onResult`), NOT the returned
         // Promise value (deliberately discarded — the returned LevelResult[] carries no scene_slot,
         // so it can't be reconciled by scene without a backend contract change). Consequence: the

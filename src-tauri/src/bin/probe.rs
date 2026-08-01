@@ -202,6 +202,100 @@ fn main() {
         }
     }
 
+    if let Some(i) = args.iter().position(|a| a == "--import-file") {
+        // --import-file <path> <listIdx>  — import a .preset FILE into an EMPTY 0-based
+        // list index (repro instrumentation; refuses an occupied target).
+        let path = args.get(i + 1).cloned().unwrap_or_default();
+        let idx: u32 = args
+            .get(i + 2)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(u32::MAX);
+        if path.is_empty() || idx == u32::MAX {
+            eprintln!("usage: probe --import-file <path> <listIdx>");
+            std::process::exit(2);
+        }
+        match tmp_companion_lib::probe_import_file(&path, idx) {
+            Ok(report) => {
+                print!("{report}");
+                return;
+            }
+            Err(e) => {
+                eprintln!("[probe] FAILED: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if let Some(i) = args.iter().position(|a| a == "--scene-doc") {
+        // --scene-doc <listIdx> <scene…>  — rendered field-3 amp params after each
+        // recall, in the given order (arrival-order-controlled; non-destructive).
+        let idx: u32 = args
+            .get(i + 1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(u32::MAX);
+        let scenes: Vec<u32> = args
+            .iter()
+            .skip(i + 2)
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        if idx == u32::MAX || scenes.is_empty() {
+            eprintln!("usage: probe --scene-doc <listIdx> <scene…>");
+            std::process::exit(2);
+        }
+        match tmp_companion_lib::probe_scene_doc(idx, &scenes) {
+            Ok(report) => {
+                print!("{report}");
+                return;
+            }
+            Err(e) => {
+                eprintln!("[probe] FAILED: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if let Some(i) = args.iter().position(|a| a == "--knob-sweep") {
+        // --knob-sweep <listIdx> <group> <node> <param> <v1,v2,…>  (TMP_LEVELLER_STIMULUS=<wav>)
+        let idx: u32 = args
+            .get(i + 1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(u32::MAX);
+        let group = args.get(i + 2).cloned().unwrap_or_default();
+        let node = args.get(i + 3).cloned().unwrap_or_default();
+        let param = args.get(i + 4).cloned().unwrap_or_default();
+        // Strict CSV parse: a typo'd token ("0.2x") empties the whole list (Result
+        // collect), landing in the usage error below — never a silently shortened
+        // sweep that still reports success.
+        let values: Vec<f32> = args
+            .get(i + 5)
+            .and_then(|s| {
+                s.split(',')
+                    .map(|t| t.trim().parse())
+                    .collect::<Result<Vec<f32>, _>>()
+                    .ok()
+            })
+            .unwrap_or_default();
+        if idx == u32::MAX
+            || group.is_empty()
+            || node.is_empty()
+            || param.is_empty()
+            || values.is_empty()
+        {
+            eprintln!("usage: probe --knob-sweep <listIdx> <group> <node> <param> <v1,v2,…>  (TMP_LEVELLER_STIMULUS=<wav>)");
+            std::process::exit(2);
+        }
+        match tmp_companion_lib::probe_knob_sweep(idx, &group, &node, &param, &values) {
+            Ok(report) => {
+                print!("{report}");
+                return;
+            }
+            Err(e) => {
+                eprintln!("[probe] FAILED: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     if let Some(i) = args.iter().position(|a| a == "--dump-currentpresetdata") {
         // --dump-currentpresetdata [slot]  — Tier-4: capture the live field-3
         // currentPresetDataChanged on a dense-heartbeat session, dump the full
@@ -1270,8 +1364,9 @@ fn main() {
             .iter()
             .filter_map(|s| s.parse().ok())
             .collect();
+        let commit = args.iter().any(|a| a == "--commit");
         match tmp_companion_lib::probe_level_scenes_oneshot(
-            list_index, target, topology, scenes, rebalance,
+            list_index, target, topology, scenes, rebalance, commit,
         ) {
             Ok(report) => {
                 print!("{report}");
@@ -1290,6 +1385,39 @@ fn main() {
         match tmp_companion_lib::probe_reamp_state("guitar-humbucker") {
             Ok(report) => {
                 println!("{report}");
+                return;
+            }
+            Err(e) => {
+                eprintln!("[probe] FAILED: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if let Some(i) = args.iter().position(|a| a == "--reamp-multi-engage") {
+        // DIAGNOSTIC: --reamp-multi-engage <cycles> [topology]
+        // N × engage→capture→disengage on ONE connection, idle-gap-safe pacing;
+        // re-tests the "re-amp engages reliably only ONCE per connection" gotcha.
+        // Default 4 only when the argument is genuinely omitted; a present-but-invalid
+        // value (zero or non-numeric) must error — `cycles = 0` runs no cycle yet the
+        // `engaged_cycles == cycles` verdict would report success.
+        let cycles: u32 = match args.get(i + 1).filter(|s| !s.starts_with("--")) {
+            None => 4,
+            Some(s) => match s.parse() {
+                Ok(n) if n >= 1 => n,
+                _ => {
+                    eprintln!("usage: probe --reamp-multi-engage <cycles ≥ 1> [topology]");
+                    std::process::exit(2);
+                }
+            },
+        };
+        let topology = args
+            .get(i + 2)
+            .filter(|s| !s.starts_with("--"))
+            .map_or("guitar-humbucker", String::as_str);
+        match tmp_companion_lib::probe_reamp_multi_engage(topology, cycles) {
+            Ok(report) => {
+                print!("{report}");
                 return;
             }
             Err(e) => {

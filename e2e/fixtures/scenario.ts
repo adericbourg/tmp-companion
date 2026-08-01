@@ -1,7 +1,7 @@
 import { expect, type Page } from "@playwright/test";
 
 // Shared scenario setup for the dual-mode specs. The working presets live at slots
-// 400-403 (the high scratch zone, clear of the user's real presets) and are the SAME
+// 400-404 (the high scratch zone, clear of the user's real presets) and are the SAME
 // fixed presets in both modes (deterministic — same blocks every run, validated against).
 // OFFLINE they are baked into the backup fixture + the startup snapshot, so `ensureScenario`
 // finds them and skips. ONLINE they start empty, so `ensureScenario` imports the identical
@@ -16,7 +16,7 @@ export interface Preset {
 }
 
 // Role-based names (not slot numbers): the device stores these at userSlot = listIndex + 1
-// (401/402/403/404), so a slot-numbered name would read off-by-one in the backup view. The
+// (401/402/403/404/405), so a slot-numbered name would read off-by-one in the backup view. The
 // Reference is the Copy source; Target 1/2 are the edited presets; Realistic (gtrParallel1,
 // scenes + an off-branch footswitch) is the physics-spec fixture (level-defaults.spec.ts).
 export const SCENARIO: Preset[] = [
@@ -24,6 +24,7 @@ export const SCENARIO: Preset[] = [
   { slot: 401, name: "E2E Target 1" },
   { slot: 402, name: "E2E Target 2" },
   { slot: 403, name: "E2E Realistic" },
+  { slot: 404, name: "E2E Hiwatt 3S" },
 ];
 
 export async function invoke(
@@ -52,7 +53,7 @@ export async function listPresets(page: Page): Promise<Preset[]> {
   return (await invoke(page, "list_presets")) as Preset[];
 }
 
-/** Ensure the three scenario presets exist at 400/401/402. Offline: baked into the
+/** Ensure every scenario preset exists at its slot (400-404). Offline: baked into the
  *  fixture + snapshot, so a name check suffices (SimDevice state is disposable).
  *  ONLINE: always route through the ownership-verified seed — it verifies every
  *  occupied target by fixture CONTENT MARKER (not name; a user preset coincidentally
@@ -94,6 +95,26 @@ export const reampOff = (page: Page): Promise<void> =>
 /** The process-global session::REAMP_*_COUNT engage/disengage counters off the bridge.
  *  Cumulative across the server process — capture a baseline at test start and diff it
  *  (see `expectReampBalanced`) so an earlier surplus OFF can't mask a later unpaired ON. */
+// Real re-amp (measure + verify captures + save) runs well past the invoke helper's
+// 30 s default, so every ONLINE leveling/measure invoke gets a long request timeout.
+export const LEVEL_T = 280_000;
+
+// A base-leveling `level_preset` job (snake_case wire shape) — shared by the online
+// leveling specs so the job literal exists once.
+export const baseLevelJob = (slot: number, target: number) => ({
+  slot,
+  target_lufs: target,
+  save: true,
+  topology_id: "guitar-humbucker",
+  calibration_lufs: null,
+  stimulus_path: null,
+  profile_id: null,
+  block_group_id: null,
+  block_node_id: null,
+  block_parameter_id: null,
+  block_value: null,
+});
+
 export async function reampCounters(
   page: Page,
 ): Promise<{ on: number; off: number }> {
@@ -146,12 +167,24 @@ export async function isOnline(page: Page): Promise<boolean> {
   return ((await res.json()) as { online?: boolean }).online === true;
 }
 
-/** End-of-scenario teardown: clear any scenario slot we wrote (net-zero) and leave the unit
- *  on preset 001 (list index 0). Best-effort — the backend guard refuses any slot not holding
- *  the scenario name, so a real preset is never cleared. */
+/** End-of-scenario teardown. ONLINE the fixtures stay RESIDENT in the scratch slots
+ *  (400-404): the run-start pristine-checking seed self-repairs anything a run leveled,
+ *  so clearing here only forces the next run to re-import everything (~2 min of device
+ *  churn per run for nothing — adversarial-reviewed 2026-08-01). Set
+ *  TMP_E2E_CLEAR_SCENARIO=1 (or run `probe --clear <slot> <name>` per slot) for the
+ *  on-demand net-zero clean. OFFLINE the clears stay (SimDevice isolation, milliseconds).
+ *  Recovery always runs: stray sweep + recall 001 + re-amp OFF. Best-effort — the backend
+ *  guard refuses any slot not holding the scenario name, so a real preset is never cleared. */
 export async function clearScenario(page: Page): Promise<void> {
-  for (const s of SCENARIO) {
-    await quiet(page, "e2e_clear_preset", { slot: s.slot, expectName: s.name });
+  const resident =
+    (await isOnline(page)) && process.env.TMP_E2E_CLEAR_SCENARIO !== "1";
+  if (!resident) {
+    for (const s of SCENARIO) {
+      await quiet(page, "e2e_clear_preset", {
+        slot: s.slot,
+        expectName: s.name,
+      });
+    }
   }
   // Sweep any stray scenario imports an aborted seed stranded in the user's bank
   // (imports land at the FIRST EMPTY slot anywhere; guarded per slot, fail-closed).

@@ -3,40 +3,9 @@
 // warn chip + the run gets one explanatory footnote.
 
 import { describe, it, expect } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { screen } from "@testing-library/react";
 
-import { ThemeProvider } from "../theme/ThemeProvider";
-import { SummaryBody } from "../views/overlays/SummaryBody";
-import type { RunItem } from "../views/level/leveling";
-
-const base = (over: Partial<RunItem>): RunItem => ({
-  key: "p3",
-  slot: 3,
-  presetName: "Guitar",
-  isBase: true,
-  sceneSlot: null,
-  sceneName: "Whole preset",
-  tag: null,
-  footswitch: null,
-  instId: "none",
-  targetName: "Lead",
-  status: "result",
-  outcome: "done",
-  value: -22,
-  ...over,
-});
-
-const renderSummary = (items: RunItem[]) =>
-  render(
-    <ThemeProvider>
-      <SummaryBody
-        items={items}
-        stopped={false}
-        onAccept={() => undefined}
-        onRelevel={() => undefined}
-      />
-    </ThemeProvider>,
-  );
+import { base, renderSummary } from "./summaryTestUtils";
 
 describe("Summary true-peak warn chip", () => {
   it("flags a row predicted to clip", () => {

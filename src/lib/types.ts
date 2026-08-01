@@ -143,6 +143,10 @@ export interface LevelResult {
    * capture's measured true peak — an ESTIMATE, never a re-measurement. Only the
    * one-shot presetLevel path (level_preset) sets this; null otherwise. */
   true_peak_dbtp: number | null;
+  /** Post-save param-level verify (batched scene runner): true = the saved preset
+   * does NOT hold the value this result reports (do not trust the number);
+   * false = re-read and confirmed; null = not checked. */
+  persist_mismatch: boolean | null;
 }
 
 /** Result of leveling one block-acting footswitch's engaged state
@@ -156,7 +160,13 @@ export interface FootswitchLevelResult {
   target_lufs: number;
   /** Achieved engaged loudness at `final_value`. */
   predicted_lufs: number;
+  /** The knob RAN OUT: the solved value sits at a bound and the target lies beyond it, so
+   *  this sound cannot reach target at all — a re-run can't help. */
   clamped: boolean;
+  /** Off target but the knob still had room: the bounded secant spent its capture budget on
+   *  a compressed/noisy response, so the best point found was written and a RE-RUN can
+   *  improve it. Distinct from `clamped` — never collapse the two. */
+  unconverged: boolean;
   clamp_reason: string | null;
   saved: boolean;
   verify_lufs: number | null;

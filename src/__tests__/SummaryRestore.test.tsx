@@ -3,47 +3,15 @@
 // without a revert anchor (scene rows, failed pre-run read) offer nothing.
 
 import { describe, it, expect, vi } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-
-import { ThemeProvider } from "../theme/ThemeProvider";
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(() => Promise.resolve(null)),
 }));
 import { invoke } from "@tauri-apps/api/core";
 
-import { SummaryBody } from "../views/overlays/SummaryBody";
-import type { RunItem } from "../views/level/leveling";
-
-const base = (over: Partial<RunItem>): RunItem => ({
-  key: "p3",
-  slot: 3,
-  presetName: "Guitar",
-  isBase: true,
-  sceneSlot: null,
-  sceneName: "Whole preset",
-  tag: null,
-  footswitch: null,
-  instId: "none",
-  targetName: "Lead",
-  status: "result",
-  outcome: "done",
-  value: -22,
-  ...over,
-});
-
-const renderSummary = (items: RunItem[]) =>
-  render(
-    <ThemeProvider>
-      <SummaryBody
-        items={items}
-        stopped={false}
-        onAccept={() => undefined}
-        onRelevel={() => undefined}
-      />
-    </ThemeProvider>,
-  );
+import { base, renderSummary } from "./summaryTestUtils";
 
 describe("Summary restore-original", () => {
   it("restores a Base row's previous level through the device command", async () => {
