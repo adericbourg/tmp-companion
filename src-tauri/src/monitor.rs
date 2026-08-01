@@ -267,14 +267,12 @@ pub(crate) fn try_metadata_read(list_index: u32) -> Option<Result<Option<Vec<u8>
 /// Reply `NotLive` to every queued live command — called from every monitor state
 /// that can't execute on a healthy session, so senders never hang and fall back
 /// to the classic path promptly.
-#[cfg(target_os = "macos")]
 fn drain_not_live(rx: &Receiver<LiveCmd>) {
     while let Ok(cmd) = rx.try_recv() {
         let _ = cmd.reply.send(LiveReply::NotLive);
     }
 }
 
-#[cfg(target_os = "macos")]
 fn drain_metadata_not_live(rx: &Receiver<MetadataReadCmd>) {
     while let Ok(cmd) = rx.try_recv() {
         let _ = cmd.reply.send(MetadataReadReply::NotLive);
@@ -284,7 +282,6 @@ fn drain_metadata_not_live(rx: &Receiver<MetadataReadCmd>) {
 /// Execute one live op on the monitor's session — `send_and_collect` (accumulator
 /// preserved) so the triggered pushes (`PresetLoaded`, field-3, `SceneLoaded`) are
 /// decoded by the normal pump-loop pass right after.
-#[cfg(target_os = "macos")]
 fn exec_live(session: &mut Session, op: &LiveOp) -> Result<(), String> {
     match op {
         // Same wire form as `session::load_preset` / the scene-scan precedent:
@@ -300,7 +297,6 @@ fn exec_live(session: &mut Session, op: &LiveOp) -> Result<(), String> {
     }
 }
 
-#[cfg(target_os = "macos")]
 fn exec_metadata_read(
     session: &mut Session,
     cmd: &MetadataReadCmd,
@@ -313,10 +309,8 @@ fn exec_metadata_read(
 
 /// RAII guard for [`MONITOR_SESSION_LIVE`]: constructed when [`pump_loop`] starts
 /// pumping a healthy session, cleared on every exit path (incl. panics).
-#[cfg(target_os = "macos")]
 struct LiveFlagGuard;
 
-#[cfg(target_os = "macos")]
 impl LiveFlagGuard {
     fn arm() -> Self {
         MONITOR_SESSION_LIVE.store(true, SeqCst);
@@ -324,7 +318,6 @@ impl LiveFlagGuard {
     }
 }
 
-#[cfg(target_os = "macos")]
 impl Drop for LiveFlagGuard {
     fn drop(&mut self) {
         MONITOR_SESSION_LIVE.store(false, SeqCst);
@@ -456,7 +449,6 @@ struct LiveCache {
 /// anything older means the caches describe the PREVIOUS preset (e.g. the monitor
 /// reconnected after a command-driven switch and the handshake field-3 was lean) —
 /// keep them and the UI would show (and CLICK-ROUTE BY) the old preset's rows.
-#[cfg(target_os = "macos")]
 const SCENE_DOC_FRESH_MS: u128 = 1000;
 
 /// Spawn the monitor thread. Lives for the whole process; never joined (like the
@@ -464,7 +456,6 @@ const SCENE_DOC_FRESH_MS: u128 = 1000;
 /// arc is the shared `AppState.session` — the monitor READS it (`is_none()`) to prove
 /// it can own the seize, and never holds it across an open (it owns its OWN `Session`).
 /// Idle until app-level `connect_device` sets `MONITOR_ENABLED`.
-#[cfg(target_os = "macos")]
 pub fn spawn(app: tauri::AppHandle, session: Arc<Mutex<Option<Session>>>) {
     // Install the live command lane before the thread starts so `try_live_op`
     // can never observe a live flag without a sender.
@@ -481,32 +472,23 @@ pub fn spawn(app: tauri::AppHandle, session: Arc<Mutex<Option<Session>>>) {
     crate::MONITOR_SPAWNED.store(true, SeqCst);
 }
 
-#[cfg(not(target_os = "macos"))]
-pub fn spawn(_app: tauri::AppHandle, _session: Arc<Mutex<Option<Session>>>) {}
-
 /// How long to pump each inner iteration (ms). Short enough that the pause flag is
 /// checked ~8×/sec and a ~250 ms heartbeat lands close to Pro Control's 4/sec.
-#[cfg(target_os = "macos")]
 const PUMP_MS: u64 = 120;
 /// Heartbeat cadence (ms). The proven keepalive that keeps pushes flowing without
 /// the session lapsing into `connectionError` (a 10 s cadence let it lapse).
-#[cfg(target_os = "macos")]
 const HEARTBEAT_MS: u64 = 250;
 /// Backoff between reconnect attempts when no device is present / the UI session
 /// holds the seize (ms).
-#[cfg(target_os = "macos")]
 const RECONNECT_BACKOFF_MS: u64 = 300;
 /// Idle-poll cadence while live-sync is disabled (the default) — cheap flag check,
 /// no device I/O (ms).
-#[cfg(target_os = "macos")]
 const DISABLED_POLL_MS: u64 = 200;
 
 /// Bounded warmup after the first handshake if its push bodies did not include a
 /// usable graph. Short enough to keep startup bounded; the final fallback is the
 /// non-destructive field-8 active-slot read.
-#[cfg(target_os = "macos")]
 const STARTUP_GRAPH_WARMUP_STEPS: u32 = 8;
-#[cfg(target_os = "macos")]
 const STARTUP_GRAPH_WARMUP_MS: u64 = 120;
 
 /// Re-snapshot retries when a connect lands with `graph=none` (every in-session
@@ -515,19 +497,15 @@ const STARTUP_GRAPH_WARMUP_MS: u64 = 120;
 /// field-3 on its own, so without a retry the hero stays "No active preset"
 /// until the user touches the amp. A fresh handshake after a short backoff is
 /// the proven graph source; bounded so a pathological unit can't reconnect-loop.
-#[cfg(target_os = "macos")]
 const GRAPH_RETRY_MAX: u32 = 2;
-#[cfg(target_os = "macos")]
 const GRAPH_RETRY_BACKOFF_MS: u64 = 3000;
 
-#[cfg(target_os = "macos")]
 enum PumpExit {
     Disabled,
     Paused,
     Error,
 }
 
-#[cfg(target_os = "macos")]
 fn monitor_loop(
     app: tauri::AppHandle,
     session_arc: Arc<Mutex<Option<Session>>>,
@@ -706,7 +684,6 @@ fn run_monitor_iteration(
 /// command's guard clears `MONITOR_PAUSE_REQ`. (No Session is held here — the caller
 /// already dropped it — but we still ack so the command isn't stranded.) Keeps the
 /// live command lane drained so a raced sender falls back instead of hanging.
-#[cfg(target_os = "macos")]
 fn park_while_paused(
     app: &tauri::AppHandle,
     live_rx: &Receiver<LiveCmd>,
@@ -724,10 +701,8 @@ fn park_while_paused(
 
 /// Step granularity (ms) for the pause-park spin — matches the command-side wait so
 /// the resume lands promptly.
-#[cfg(target_os = "macos")]
 const PAUSE_WAIT_STEP: u64 = 25;
 
-#[cfg(target_os = "macos")]
 fn assemble_startup_snapshot(
     session: &mut Session,
 ) -> Result<(StartupSnapshot, Option<session::CurrentPresetLive>, bool), String> {
@@ -749,7 +724,6 @@ fn assemble_startup_snapshot(
     ))
 }
 
-#[cfg(target_os = "macos")]
 fn startup_live(session: &mut Session) -> (Option<session::CurrentPresetLive>, bool) {
     if let Some(live) = live_from_pushes(session) {
         return (Some(live), false);
@@ -789,7 +763,6 @@ fn startup_live(session: &mut Session) -> (Option<session::CurrentPresetLive>, b
     }
 }
 
-#[cfg(target_os = "macos")]
 fn live_from_pushes(session: &Session) -> Option<session::CurrentPresetLive> {
     let active_slot = session.loaded_slot();
     for body in session.push_bodies().iter().rev() {
@@ -812,7 +785,6 @@ fn live_from_pushes(session: &Session) -> Option<session::CurrentPresetLive> {
 /// `HEARTBEAT_MS`. Mirrors `Session::listen_dump` but emits Tauri events instead of
 /// printing and yields the device promptly on a pause request. Returns on any HID
 /// error (device gone / seize lost) or when a pause is requested.
-#[cfg(target_os = "macos")]
 fn pump_loop(
     app: &tauri::AppHandle,
     mut session: Session,
@@ -885,7 +857,6 @@ fn pump_loop(
 /// Decode one inbound stream body and emit the matching Tauri event(s). Reuses the
 /// shared `session::decode_*` push decoders (no second parser). Updates the coalescing
 /// cache for `live-preset` and the base-slot classifier.
-#[cfg(target_os = "macos")]
 /// Emit `tmp://scene-list` from the cached scene names, tagging each row with its
 /// real footswitch (`ftsw_map`, displayed 1-based) or `null` (em-dash). Called when
 /// the scene-list push arrives AND re-called when a later field-3 `ftsw` fills the
@@ -1124,7 +1095,6 @@ fn decode_and_emit(app: &tauri::AppHandle, body: &[u8], cache: &mut LiveCache) {
 
 /// True-ish: extract a hex of a `ConnectionMessage.connectionError` (TMS field 4,
 /// inner field 3) body for the lapse warning, else None.
-#[cfg(target_os = "macos")]
 fn decode_connection_error(body: &[u8]) -> Option<String> {
     let top = crate::proto::parse(body);
     let cm = crate::proto::first_bytes(&top, 4)?;
@@ -1148,13 +1118,11 @@ impl LiveCache {
     }
 }
 
-#[cfg(target_os = "macos")]
 fn emit_sync(app: &tauri::AppHandle, syncing: bool) {
     use tauri::Emitter;
     let _ = app.emit(EVT_SYNC, SyncPayload { syncing });
 }
 
-#[cfg(target_os = "macos")]
 fn sleep(ms: u64) {
     std::thread::sleep(std::time::Duration::from_millis(ms));
 }
