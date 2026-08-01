@@ -1,6 +1,6 @@
 ---
 name: verify
-description: "The definition-of-done runbook for tmp-companion. Use before declaring ANY change done — it maps the change class (docs / frontend / backend / device-facing / leveling-math) to the checks that must be green, names the traps that produce a false-green result (stale :7600, fresh-worktree deps, online seeding), and states the standing rules for shipping an invariant, deferring a fix, or closing a user-reported bug. Advisory: `scripts/gates.sh` + the pre-push/PreToolUse hooks are what actually block a red push or PR — this skill is the checklist a zero-context session follows to get there without re-deriving it."
+description: "The definition-of-done runbook for tmp-companion. Use before declaring ANY change done — it maps the change class (docs / frontend / backend / device-facing / leveling-math) to the checks that must be green, names the traps that produce a false-green result, and states the standing rules for shipping an invariant, deferring a fix, or closing a user-reported bug. Advisory: `scripts/gates.sh` plus the pre-push and PreToolUse hooks are what actually block a red push or PR — this skill is the checklist a zero-context session follows to get there."
 ---
 
 # /verify — definition of done
@@ -45,20 +45,20 @@ What `gates.sh` **cannot** do for you — attended, hardware-gated, layered on t
 
 ## 3. Traps that produce a false result
 
-- **Stale bridge server = false-green OR false-online** (CLAUDE.md's "stale-fake-online trap").
+- **Stale bridge server = false-green OR false-online** (CLAUDE.md, "Traps that fire when you run something").
   `scripts/e2e.sh` kills the port before every run, but a direct `bunx playwright test` invocation
   can hit a leftover WRONG-mode server via `reuseExistingServer: true`. Kill the REAL port first,
   always — in a worktree that's the per-worktree DERIVED port (`TMP_E2E_PORT`, offset off 7600
   since the port-isolation PR), not necessarily 7600; check `$TMP_E2E_PORT` or the e2e.sh log
   line before killing a hardcoded port.
-- **Fresh worktree needs deps before checks, not just before dev** (CLAUDE.md's "Fresh-clone /
+- **Fresh worktree needs deps before checks, not just before dev** (CLAUDE.md's "Traps that fire when you run something" /
   worktree traps" section) — `bun install` before typecheck/lint/test/build, `bun run build`
   before any `cargo` gate.
 - **Online false-green tell:** confirm the server log prints `seeded snapshot from the real
 device` (or `/health` reports `online: true`) before trusting a pass — a stale offline server
   reused under `TMP_E2E_ONLINE=1` looks identical until you check.
-- **Never `list_my_presets_strict` in a seed/sweep/write-path list read** — see CLAUDE.md's HID
-  open-lockout note for why (tolerant reads are correct there; strict is snapshot/monitor-only).
+- **Never `list_my_presets_strict` in a seed/sweep/write-path list read** — see `.claude/rules/danger.md`'s HID
+  open-lockout rule for why (tolerant reads are correct there; strict is snapshot/monitor-only).
 - **A soak/online run needs the unit rested and Pro Control closed** — same preconditions as any
   online `e2e.sh` invocation; a handshake failure reports the "close Pro Control" hint.
 - **A docs-only change gets NO automated gate**, so nothing catches a stray non-ASCII character

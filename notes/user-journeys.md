@@ -1,5 +1,20 @@
 # User journeys — coverage map + bug→gate registry
 
+**How this file is organised.** Each section below is ONE contiguous GFM table — a journey or a
+bug is exactly one row, which is why individual lines run long. Do not insert a heading between
+rows: it would end the table and orphan its header row. To add a grouping, start a new table with
+its own header.
+
+| Section                                                                 | What it lists                                          |
+| ----------------------------------------------------------------------- | ------------------------------------------------------ |
+| [Level](#level)                                                         | Leveling journeys — setup, run, stop/cancel, summary   |
+| [Cross-feature](#cross-feature-shared-startup-backup-scan)              | The shared startup backup scan                         |
+| [Doctor](#doctor)                                                       | Tone-diagnosis journeys                                |
+| [Copy](#copy)                                                           | Block-copy journeys                                    |
+| [Songs](#songs)                                                         | Songs and setlists journeys                            |
+| [Reliability and safety invariants](#reliability-and-safety-invariants) | Cross-cutting guarantees                               |
+| [Bug→gate registry](#buggate-registry)                                  | Every reported bug class and the gate that now pins it |
+
 Living doc. A journey's coverage verdict is **FULL** (an automated gate exercises the real
 outcome, not just a terminal-state smoke), **PARTIAL** (some layer covers it — often a mocked
 Vitest path or a pure-function unit test — but the end-to-end behavior isn't gated), or **NONE**
@@ -65,7 +80,7 @@ on every FULL row before assuming "blocked on every push."
 | Song/setlist CRUD                         | FULL     | `e2e/specs/songs.spec.ts`       |
 | Add songs to a setlist + reorder + remove | NONE     | none (e2e-test-plan.md S10/S12) |
 
-## Reliability / safety invariants
+## Reliability and safety invariants
 
 | Journey                                                                                                                                                           | Coverage                                          | Gate                                                                          |
 | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------- | ----------------------------------------------------------------------------- |

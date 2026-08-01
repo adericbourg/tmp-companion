@@ -1,8 +1,18 @@
 # Gotchas — the HW evidence behind the rules
 
-Companion to `CLAUDE.md`'s Gotchas section. That section states every rule; this file carries the
-evidence, the failure each rule prevents, and the protocol detail — for the entries too long to keep
-inline. **Concise rules stay in `CLAUDE.md` only and are deliberately not duplicated here.**
+The evidence appendix for the repo's always-loaded rules. This file carries each rule's full
+statement, the hardware evidence behind it, and the failure it prevents.
+
+Where a rule is stated in more than one place, the split is deliberate:
+
+- **`.claude/rules/danger.md`** — the danger rules in full (data loss, device wedging, machine
+  crashes). Always loaded, re-injected after compaction.
+- **`CLAUDE.md`** — the traps that fire while _running_ a command rather than editing a file,
+  plus a one-line index of the rules below.
+- **the OTHER `.claude/rules/*.md`** (every one except `danger.md` above) — path-scoped
+  conventions that load only when you edit a file the rule's `paths:` glob matches.
+- **This file** — the long form. Where both state a rule, this one is the fuller text; they do
+  not contradict.
 
 Read the entry in full before changing the behaviour it governs.
 
