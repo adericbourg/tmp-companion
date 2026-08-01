@@ -613,7 +613,7 @@ mod imp {
 /// The blocking `poll`/`read` loop replaces `CFRunLoopRunInMode` and is a good deal
 /// simpler — no run loop, no C callback, no shared receive buffer.
 ///
-/// # Inbound framing needs no fixup (measured, fw 1.8.45)
+/// # Inbound framing needs no fixup (measured, fw 1.8.58)
 ///
 /// Inbound frames are parsed as `[0x00, magic, _, body_len, …]` while OUTBOUND frames
 /// put the magic at index 0 (`proto::make_envelope`). That asymmetry looks like a
@@ -906,7 +906,7 @@ mod tests {
     /// that should have stopped it.
     #[test]
     fn a_real_inbound_report_needs_no_report_id_fixup() {
-        // Byte-for-byte head of a report captured from a TMP on fw 1.8.45 (the 0x35
+        // Byte-for-byte head of a report captured from a TMP on fw 1.8.58 (the 0x35
         // single-frame reply that opens a preset-list harvest), zero-padded to 64.
         let mut raw = vec![0u8; 64];
         raw[..4].copy_from_slice(&[0x00, 0x35, 0x00, 0x06]);
