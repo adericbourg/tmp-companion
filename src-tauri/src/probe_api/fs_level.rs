@@ -229,6 +229,205 @@ pub fn probe_bake_validate(
     Ok(out)
 }
 
+/// `probe --fs-sweep <listIdx> <switch> <group> <node> <param> <v1,v2,…>` — the response
+/// curve the footswitch solver actually feeds on. Unlike `--knob-sweep` (which forces NO
+/// bypass, so a base-bypassed pedal stays inert and every point reads the base sound), this
+/// takes the isolation list from `<switch>`'s own plan — the target switch's block(s)
+/// engaged, every sibling block-switch forced off — exactly the `engaged_bypass` the
+/// production `measure_footswitch` sweeps under. `<node>.<param>` is arbitrary, so the same
+/// arm also measures an AMP knob under a switch's engaged state (e.g. the amp `outputLevel`
+/// with a drive pedal on).
+///
+/// Diagnostic only: no writes are persisted (the final reload discards the working-copy
+/// sweep), and it ends with the guaranteed re-amp OFF. Stimulus via `TMP_LEVELLER_STIMULUS`
+/// (injected verbatim, like a calibrated profile's DI capture).
+pub fn probe_fs_sweep(
+    list_index: u32,
+    switch: u32,
+    group: &str,
+    node: &str,
+    param: &str,
+    values: &[f32],
+) -> Result<String, String> {
+    let stim_path = std::env::var("TMP_LEVELLER_STIMULUS")
+        .map_err(|_| "set TMP_LEVELLER_STIMULUS to the stimulus WAV".to_string())?;
+    let stim = read_stimulus_calibrated(&stim_path, None)?;
+    let (preset, _, _) = read_slot_preset_parsed(list_index)?;
+    let ftsw = preset
+        .get("ftsw")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    // The isolation list comes from the switch's own plan, so the sweep sits in exactly the
+    // engaged state `measure_footswitch` measures — never a hand-built approximation.
+    let infos = footswitch::enumerate_block_footswitches(&ftsw, &preset);
+    let info = infos
+        .iter()
+        .find(|i| i.switch == switch)
+        .ok_or_else(|| format!("switch {switch} is not block-acting in this preset"))?;
+    let lp = info
+        .level_params
+        .first()
+        .ok_or("switch has no level-param candidate")?;
+    let plan = footswitch::plan_footswitch_jobs(
+        &ftsw,
+        &preset,
+        &[footswitch::FsJobKey {
+            switch,
+            lev_node: &lp.node_id,
+            lev_param: &lp.parameter_id,
+            target_bits: (-23.0f64).to_bits(),
+        }],
+    )
+    .into_iter()
+    .next()
+    .ok_or("planner returned no plan")?;
+    let engaged = match &plan {
+        footswitch::FsLevelPlan::Bake { engaged, .. }
+        | footswitch::FsLevelPlan::Assign { engaged } => engaged.clone(),
+        other => {
+            return Err(format!(
+                "switch {switch} plans as {other:?}, no isolation list"
+            ))
+        }
+    };
+
+    {
+        let mut s = Session::connect_lean()?;
+        s.load_preset(list_index)?;
+        std::thread::sleep(std::time::Duration::from_millis(
+            leveller::settle_after_load_ms(),
+        ));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(leveller::RECONNECT_GAP_MS));
+
+    let mut out = format!(
+        "[probe --fs-sweep] list_index={list_index} FS{switch} {group}/{node}.{param}\n  isolation: {engaged:?}\n"
+    );
+    for v in values {
+        // A silent point is DATA here (the knob's bottom end), not a failure — record it
+        // and keep sweeping instead of aborting the whole curve like the solver does.
+        match leveller::measure_fs_at((group, node, param), &engaged, &stim, *v) {
+            Ok(l) => {
+                out += &format!(
+                    "  {param}={v:.3} → integrated {:.3} LUFS  short-term-max {:.3}  spread {:.2} LU\n",
+                    l.integrated_lufs,
+                    l.short_term_max_lufs,
+                    l.spread_lu()
+                );
+            }
+            Err(e) => out += &format!("  {param}={v:.3} → ERR {e}\n"),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(leveller::RECONNECT_GAP_MS));
+    }
+    if let Ok(mut s) = Session::connect_lean() {
+        let _ = s.load_preset(list_index);
+    }
+    leveller::reamp_off_guaranteed("fs-sweep");
+    Ok(out)
+}
+
+/// `probe --amp-recipe <listIdx> <group> <ampNode> <gain> <outputLevel>` — measure a candidate
+/// AMP operating point across a preset's whole footswitch set in ONE pass: writes the two amp
+/// knobs, then captures base (every block-acting switch forced OFF) and each switch engaged in
+/// turn, under the production force-list (`doctor_force_bypass` — the off-in-base/
+/// switch-enables-it composition; a PARAM-only footswitch has no on-off flip, so its isolation
+/// collapses to base and its gap row is structurally ≈0, not evidence about that switch).
+///
+/// This exists because the base↔boost GAP is a property of the amp's operating point, not of any
+/// one switch — a per-knob sweep can't show it. Diagnostic only: nothing is saved (the final
+/// reload discards the working-copy writes) and it ends with the guaranteed re-amp OFF.
+/// Stimulus via `TMP_LEVELLER_STIMULUS` (injected verbatim, like a calibrated profile's capture).
+pub fn probe_amp_recipe(
+    list_index: u32,
+    group: &str,
+    amp_node: &str,
+    gain: f32,
+    output_level: f32,
+) -> Result<String, String> {
+    let stim_path = std::env::var("TMP_LEVELLER_STIMULUS")
+        .map_err(|_| "set TMP_LEVELLER_STIMULUS to the stimulus WAV".to_string())?;
+    let stim = read_stimulus_calibrated(&stim_path, None)?;
+    let (preset, _, _) = read_slot_preset_parsed(list_index)?;
+    let ftsw = preset
+        .get("ftsw")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let infos = footswitch::enumerate_block_footswitches(&ftsw, &preset);
+    if infos.is_empty() {
+        return Err("preset has no block-acting footswitches".to_string());
+    }
+    // Base = every block-acting switch's ON-OFF node forced OFF — `doctor_force_bypass(None)`,
+    // the one cross-module owner of this force-list (same definition the Base leveling job
+    // uses: "all footswitches off", NOT as-saved).
+    let base_off = crate::commands::doctor::doctor_force_bypass(&ftsw, &preset, None);
+
+    {
+        let mut s = Session::connect_lean()?;
+        s.load_preset(list_index)?;
+        std::thread::sleep(std::time::Duration::from_millis(
+            leveller::settle_after_load_ms(),
+        ));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(leveller::RECONNECT_GAP_MS));
+
+    let measure = |engaged: &[(String, String, bool)]| -> Result<f64, String> {
+        let mut s = Session::connect_lean()?;
+        // Recall base FIRST: a load activates the saved `lastLoadedScene`, and the recall also
+        // re-asserts base's own bypass state — wiping the previous iteration's forced writes so
+        // nothing leaks between measurements. Every write below lands after it.
+        s.load_scene(crate::session::BASE_SCENE_SLOT)?;
+        std::thread::sleep(std::time::Duration::from_millis(
+            leveller::SETTLE_AFTER_SCENE_RECALL_MS,
+        ));
+        s.change_parameter(group, amp_node, "gain", gain)?;
+        s.change_parameter(group, amp_node, "outputLevel", output_level)?;
+        for (g, n, byp) in engaged {
+            s.change_parameter_bool(g, n, "bypass", *byp)?;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(
+            leveller::SETTLE_AFTER_SET_MS,
+        ));
+        Ok(leveller::engage_measure_disengage(&mut s, &stim)?.integrated_lufs)
+    };
+
+    let mut out = format!(
+        "[probe --amp-recipe] idx {list_index} · {group}/{amp_node}  gain={gain} outputLevel={output_level}\n"
+    );
+    let base = measure(&base_off);
+    match &base {
+        Ok(l) => out += &format!("  base (all switches off)      {l:8.2} LUFS\n"),
+        Err(e) => out += &format!("  base (all switches off)      ERR {e}\n"),
+    }
+    for info in &infos {
+        std::thread::sleep(std::time::Duration::from_millis(leveller::RECONNECT_GAP_MS));
+        // The production composition (siblings forced off PLUS this switch's own engaged
+        // flip) via its one cross-module owner — never the flip alone, which would leave
+        // earlier iterations' pedals audible in this switch's capture.
+        let engaged =
+            crate::commands::doctor::doctor_force_bypass(&ftsw, &preset, Some(info.switch));
+        let label = info
+            .functions
+            .first()
+            .map(|f| f.node_id.clone())
+            .unwrap_or_default();
+        match measure(&engaged) {
+            Ok(l) => {
+                let gap = base.as_ref().map(|b| l - b).unwrap_or(f64::NAN);
+                out += &format!(
+                    "  FS{} {label:24} {l:8.2} LUFS   gap {gap:+.2} LU\n",
+                    info.switch
+                );
+            }
+            Err(e) => out += &format!("  FS{} {label:24} ERR {e}\n", info.switch),
+        }
+    }
+    if let Ok(mut s) = Session::connect_lean() {
+        let _ = s.load_preset(list_index);
+    }
+    leveller::reamp_off_guaranteed("amp-recipe");
+    Ok(out)
+}
+
 /// Probe (read-only): list a slot's block-acting footswitches with each acted-on block's base
 /// bypass + the bake/assign classification for its first level param — to find bake-eligible
 /// presets (an active on-off enabling an OFF-in-base block). `has_fs_scenes` is printed as a raw
@@ -577,6 +776,85 @@ pub fn probe_fs_batch(list_index: u32, values: Vec<f32>) -> Result<String, Strin
     out += &format!(
         "wrote {} switch(es) on ONE session + ONE save — export the slot to verify\n",
         pends.len()
+    );
+    Ok(out)
+}
+
+/// `probe --set-param-save <listIdx> <expectName> <group> <node> <param> <value> [save]` —
+/// write ONE numeric block parameter and (with `save`) PERSIST it to any slot — unlike
+/// `--set-param` (slot_write.rs), which is scratch-zone-only and working-copy-only. The
+/// mandatory `expectName` is checked against the slot's non-destructive `displayName` read
+/// INSIDE this function (the destructive-op guard rule: same address space as the mutation —
+/// a dry-run eyeball is not a guard, since the save re-run is a separate invocation that can
+/// carry a different index). DRY by default; the save path reuses the `--bake-validate`
+/// write+save shape (heartbeat-live session, never re-amped, BASE recalled before the write
+/// per the scene-context rule) and read-back-verifies the stored value. Scene-overlay
+/// mirroring is out of scope (this is a probe diagnostic, not the product write path) — on a
+/// preset WITH scenes, overlays that restate the param keep their authored values.
+pub fn probe_set_param_save(
+    list_index: u32,
+    expect_name: &str,
+    group: &str,
+    node: &str,
+    param: &str,
+    value: f32,
+    save: bool,
+) -> Result<String, String> {
+    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+        return Err(format!(
+            "refusing value {value}: block parameters are normalised 0.0..=1.0"
+        ));
+    }
+    let (preset, _, _) = read_slot_preset_parsed(list_index)?;
+    let name = preset
+        .get("info")
+        .and_then(|i| i.get("displayName"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("?")
+        .to_string();
+    if name != expect_name {
+        return Err(format!(
+            "refusing slot {}: reads \u{201c}{name}\u{201d}, expected \u{201c}{expect_name}\u{201d}",
+            list_index + 1
+        ));
+    }
+    let before = node_param_f64(&preset, node, param)
+        .ok_or_else(|| format!("{node}.{param} not found in slot {}", list_index + 1))?;
+    let mut out = format!(
+        "[probe --set-param-save] slot {} \u{201c}{name}\u{201d} \u{b7} {group}/{node}.{param}\n  before: {before:.4}\n",
+        list_index + 1
+    );
+    if !save {
+        out += &format!("  DRY \u{2014} would write {value:.4} (re-run with `save` to persist)\n");
+        return Ok(out);
+    }
+    std::thread::sleep(std::time::Duration::from_millis(leveller::RECONNECT_GAP_MS));
+    {
+        let mut s = Session::connect()?;
+        s.begin_live_edit()?;
+        s.load_preset(list_index)?;
+        for _ in 0..8 {
+            let _ = s.heartbeat();
+            let _ = s.pump_collect(150);
+        }
+        s.load_scene(crate::session::BASE_SCENE_SLOT)?;
+        std::thread::sleep(std::time::Duration::from_millis(
+            leveller::SETTLE_AFTER_SCENE_RECALL_MS,
+        ));
+        s.change_parameter(group, node, param, value)?;
+        s.save_current_preset(list_index)?;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(leveller::RECONNECT_GAP_MS));
+    let (after_preset, _, _) = read_slot_preset_parsed(list_index)?;
+    let after = node_param_f64(&after_preset, node, param)
+        .ok_or_else(|| format!("{node}.{param} vanished after save"))?;
+    out += &format!(
+        "  after : {after:.4}  \u{21d2}  {}\n",
+        if (after - value as f64).abs() < 1e-3 {
+            "SAVED"
+        } else {
+            "MISMATCH \u{2014} verify the slot manually"
+        }
     );
     Ok(out)
 }
