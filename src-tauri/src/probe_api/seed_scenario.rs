@@ -217,26 +217,100 @@ fn extract_preset_level(body: &[u8]) -> Option<f64> {
     rest[..end].parse().ok()
 }
 
-/// Pristine = the on-device body's `presetLevel` still matches the fixture's.
-/// A strict-harness run LEVELS the fixtures with save — the ownership marker
-/// survives that, so a marker-only skip hands the NEXT run pre-leveled state
-/// (HW: the Hiwatt at 404 carried presetLevel 0.37495 vs the fixture's 0.5999
-/// → the base lane skipped as "already at target" and the spec fast-failed).
-/// Unreadable/truncated-past-the-level bodies count as NOT pristine: ownership
-/// is already proven, so the worst case is a redundant re-import.
-fn body_is_pristine(body: &[u8], fixture_json: &str) -> bool {
-    // Rev gate first: a resident copy of an OLDER fixture revision is never pristine,
-    // whatever its levels read (see `FIXTURE_SOURCE_STAMP`).
-    if !String::from_utf8_lossy(body).contains(FIXTURE_SOURCE_STAMP) {
-        return false;
+/// Substring-extract the ORDERED sequence of every `"FenderId":"<value>"` occurrence —
+/// the base `audioGraph` block chain (`guitarNodes`/`micNodes` arrays-of-objects, each
+/// carrying its own `"FenderId"` field). Same truncation-tolerant philosophy as
+/// [`extract_preset_level`]: a serde parse would fail on a tail-truncated field-8
+/// partial, and on the fixture-json side would not guarantee the same left-to-right
+/// ordering this byte scan gets for free on both sides — which is what makes the
+/// device-vs-fixture compare sound. Scene overlays key nodes by id
+/// (`scenes[].guitarNodes.G1.<FenderId>`, an object keyed BY the id, never a
+/// `"FenderId"` field), so this only ever sees the BASE block list — exactly the
+/// list `copy_apply`'s delete/insert/replace ops mutate, and exactly what value-only
+/// writes (leveling's `presetLevel`, a knob's `dspUnitParameters`, a footswitch's
+/// `valueA`) never touch. A body truncated mid-chain yields a proper PREFIX of the
+/// full chain, which a later equality compare rejects — fail-closed, not a false pass.
+fn extract_fender_chain(text: &str) -> Vec<String> {
+    const NEEDLE: &str = "\"FenderId\":\"";
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(i) = rest.find(NEEDLE) {
+        rest = &rest[i + NEEDLE.len()..];
+        let Some(end) = rest.find('"') else { break };
+        out.push(rest[..end].to_string());
+        rest = &rest[end..];
     }
-    match (
+    out
+}
+
+/// Test-only convenience over [`pristine_check`] — collapses its `Result` to a
+/// bool for the majority of assertions below that only need the pass/fail shape;
+/// a few also assert on the `Err` variant directly to pin which sub-check fired.
+/// Production calls `pristine_check` itself so the caller can log WHICH sub-check
+/// failed instead of a fixed guess (see [`PristineMiss`]).
+#[cfg(test)]
+fn body_is_pristine(body: &[u8], fixture_json: &str) -> bool {
+    pristine_check(body, fixture_json).is_ok()
+}
+
+/// Which of [`pristine_check`]'s three sub-checks rejected a body — kept distinct
+/// from a plain bool so the caller can log an HONEST reason. The two substantive
+/// gates (level, chain) fail independently (a level-drifted-only body still has a
+/// matching chain, and vice versa — see `pristine_check_flags_a_structural_block_delete`),
+/// so a caller that hardcodes one reason string regardless of which check actually
+/// tripped is silently wrong half the time; that was the bug here before this type
+/// existed (see `pristine_check`'s doc comment for the full incident).
+#[derive(Debug, PartialEq, Eq)]
+enum PristineMiss {
+    /// The resident body predates the fixture's `FIXTURE_SOURCE_STAMP` revision.
+    StaleRevision,
+    /// `presetLevel` no longer matches the fixture (a leveling/knob save).
+    LevelDrift,
+    /// The base `audioGraph` block chain ([`extract_fender_chain`]) no longer
+    /// matches the fixture (a structural edit — e.g. `copy_apply`'s delete/insert).
+    ChainDrift,
+}
+
+/// Pristine = the on-device body's `presetLevel` still matches the fixture's AND its
+/// base block chain ([`extract_fender_chain`]) is IDENTICAL to the fixture's. The
+/// presetLevel check alone catches a strict-harness LEVEL run (a strict-harness run
+/// LEVELS the fixtures with save — the ownership marker survives that, so a
+/// marker-only skip hands the NEXT run pre-leveled state; HW: the Hiwatt at 404
+/// carried presetLevel 0.37495 vs the fixture's 0.5999 → the base lane skipped as
+/// "already at target" and the spec fast-failed) but is BLIND to a structural edit
+/// that never touches `presetLevel` — HW-reproduced 2026-08-01: `copy.spec.ts`
+/// deleted E2E Target 2's trailing `ACD_FiveBandParamEQ` block and saved, the marker
+/// AND presetLevel both survived that save, and the presetLevel-only check classified
+/// the mutilated body pristine, skipping the re-import doctor's oracle then relied on.
+/// The chain compare closes that gap without disturbing the level-drift case: leveling
+/// and doctor-param saves never touch a `"FenderId"` occurrence, so the chain still
+/// matches even though presetLevel legitimately drifted (the level check is still the
+/// one that fails THAT case). Unreadable/truncated-past-the-level or mid-chain bodies
+/// count as NOT pristine either way: ownership is already proven, so the worst case is
+/// a redundant re-import. Returns the FIRST sub-check that fails (rev, then level,
+/// then chain) — a caller that wants an honest re-import reason should log the
+/// returned [`PristineMiss`] rather than assume which one fired.
+fn pristine_check(body: &[u8], fixture_json: &str) -> Result<(), PristineMiss> {
+    let body_str = String::from_utf8_lossy(body);
+    // Rev gate first: a resident copy of an OLDER fixture revision is never pristine,
+    // whatever its levels or chain read (see `FIXTURE_SOURCE_STAMP`).
+    if !body_str.contains(FIXTURE_SOURCE_STAMP) {
+        return Err(PristineMiss::StaleRevision);
+    }
+    let level_matches = match (
         extract_preset_level(body),
         extract_preset_level(fixture_json.as_bytes()),
     ) {
         (Some(dev), Some(fix)) => (dev - fix).abs() < 1e-3,
         _ => false,
+    };
+    if !level_matches {
+        return Err(PristineMiss::LevelDrift);
     }
+    if extract_fender_chain(&body_str) != extract_fender_chain(fixture_json) {
+        return Err(PristineMiss::ChainDrift);
+    }
+    Ok(())
 }
 
 /// Does the field-8 body identify itself as `name`? Back-to-back slot reads on one
@@ -406,10 +480,14 @@ pub(crate) fn seed_scenario_core(check_pristine: bool) -> Result<SeedOutcome, St
                  preset (stale/mismatched read) — keeping the marker-skip",
                 p.list_index, p.name
             );
-        } else if !body_is_pristine(&body, &p.preset_json) {
+        } else if let Err(miss) = pristine_check(&body, &p.preset_json) {
+            let why = match miss {
+                PristineMiss::StaleRevision => "resident copy is an older fixture revision",
+                PristineMiss::LevelDrift => "presetLevel drifted",
+                PristineMiss::ChainDrift => "block chain drifted (structural edit)",
+            };
             eprintln!(
-                "[seed] slot {} ({:?}) is fixture-owned but not pristine \
-                 (presetLevel drifted) — re-importing",
+                "[seed] slot {} ({:?}) is fixture-owned but not pristine ({why}) — re-importing",
                 p.list_index, p.name
             );
             to_seed.push(p);
@@ -635,12 +713,84 @@ mod tests {
         assert!(!body_names(named, "E2E Hiwatt 3S"));
     }
 
+    /// Non-regression gate for the 2026-08-01 incident: `copy.spec.ts` deletes E2E
+    /// Target 2's trailing `ACD_FiveBandParamEQ` block and saves; the fixture marker
+    /// AND `presetLevel` both survive that save (only the block list changed), so the
+    /// presetLevel-only check used to classify the mutilated body pristine and skip
+    /// the re-import doctor's diagnosis oracle relied on. A two-block fixture with its
+    /// LAST `FenderId` occurrence removed (the exact shape of that delete) must fail
+    /// `body_is_pristine` even though the stamp and `presetLevel` are both intact —
+    /// only the new chain compare can catch this.
+    #[test]
+    fn pristine_check_flags_a_structural_block_delete() {
+        let fixture = r#"{"info":{"source_id":"tmp-companion-e2e-fixture#r2"},"audioGraph":{"presetLevel":0.32,"guitarNodes":{"G1":[{"FenderId":"ACD_TubeScreamer","nodeId":"ACD_TubeScreamer"},{"FenderId":"ACD_FiveBandParamEQ","nodeId":"ACD_FiveBandParamEQ"}]}}}"#;
+        // The unmodified fixture passes against itself.
+        assert!(body_is_pristine(fixture.as_bytes(), fixture));
+
+        // The copy-delete shape: stamp + presetLevel intact, trailing block gone.
+        let mutilated = r#"{"info":{"source_id":"tmp-companion-e2e-fixture#r2"},"audioGraph":{"presetLevel":0.32,"guitarNodes":{"G1":[{"FenderId":"ACD_TubeScreamer","nodeId":"ACD_TubeScreamer"}]}}}"#;
+        assert!(
+            !body_is_pristine(mutilated.as_bytes(), fixture),
+            "a body missing its trailing FenderId block must NOT read pristine"
+        );
+        assert_eq!(
+            extract_fender_chain(mutilated),
+            vec!["ACD_TubeScreamer".to_string()],
+            "the mutilated body's chain is a proper prefix of the fixture's"
+        );
+        // The reason the caller logs must actually discriminate: a structural delete
+        // is rejected by the CHAIN gate, not mislabeled as a level drift (the
+        // pre-fix log string was hardcoded to "presetLevel drifted" regardless of
+        // which sub-check tripped, which misled a real online investigation).
+        assert_eq!(
+            pristine_check(mutilated.as_bytes(), fixture),
+            Err(PristineMiss::ChainDrift)
+        );
+
+        // Value-only drift (presetLevel) must NOT trip the chain gate — leveling and
+        // doctor-param saves never touch a `"FenderId"` occurrence, so the chain
+        // compare alone reads equal; `body_is_pristine`'s overall false comes ONLY
+        // from the existing presetLevel gate, not from this one (pins the tolerance
+        // both checks are independently responsible for their own drift class).
+        let level_drifted = r#"{"info":{"source_id":"tmp-companion-e2e-fixture#r2"},"audioGraph":{"presetLevel":0.5,"guitarNodes":{"G1":[{"FenderId":"ACD_TubeScreamer","nodeId":"ACD_TubeScreamer"},{"FenderId":"ACD_FiveBandParamEQ","nodeId":"ACD_FiveBandParamEQ"}]}}}"#;
+        assert_eq!(
+            extract_fender_chain(level_drifted),
+            extract_fender_chain(fixture),
+            "presetLevel drift alone must not move the chain"
+        );
+        assert!(
+            !body_is_pristine(level_drifted.as_bytes(), fixture),
+            "still not pristine overall — via the presetLevel gate, not the chain gate"
+        );
+        assert_eq!(
+            pristine_check(level_drifted.as_bytes(), fixture),
+            Err(PristineMiss::LevelDrift),
+            "level-only drift must report as LevelDrift, not ChainDrift"
+        );
+
+        // A body truncated MID-chain (cut inside the second block, after presetLevel
+        // has already been read) must fail closed: its chain is a proper prefix, not
+        // an empty/unreadable read that the presetLevel-only truncation case covers.
+        let cut_at = fixture
+            .find(r#",{"FenderId":"ACD_FiveBandParamEQ"#)
+            .expect("cut point exists");
+        let truncated = &fixture[..cut_at];
+        assert_eq!(
+            extract_fender_chain(truncated),
+            vec!["ACD_TubeScreamer".to_string()]
+        );
+        assert!(
+            !body_is_pristine(truncated.as_bytes(), fixture),
+            "a body truncated mid-chain must not read pristine"
+        );
+    }
+
     /// A fixture regen that drops the `source_id` stamp must fail here, not on
     /// the unit (the guards would refuse to manage unmarked copies).
     #[test]
     fn committed_fixtures_carry_an_ownership_marker() {
         let spec = scenario_spec().expect("committed spec parses");
-        assert_eq!(spec.len(), 5, "every committed scenario preset is checked");
+        assert_eq!(spec.len(), 6, "every committed scenario preset is checked");
         for p in &spec {
             assert!(
                 is_fixture_body(p.preset_json.as_bytes()),
