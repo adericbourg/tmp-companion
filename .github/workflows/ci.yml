@@ -147,6 +147,13 @@ jobs:
       # on GitHub's own ubuntu-latest hardware, not just underpowered local boxes);
       # macos-14 has no such issue at the default worker count. Serializing on Linux
       # trades CI minutes for reliability rather than touching the shared spec/config.
+      #
+      # The non-Linux branch is deliberately EMPTY, not "3": `bun run e2e` is
+      # scripts/e2e.sh, whose `WORKERS="${TMP_E2E_WORKERS:-3}"` substitutes on empty as
+      # well as unset and re-exports the resolved value before Playwright ever starts.
+      # So empty means "take e2e.sh's default" and there is exactly one place that
+      # default lives; hardcoding 3 here would let macOS CI silently diverge from a
+      # local run if it ever changed.
       - name: Offline e2e (SimDevice)
         run: bun run e2e
         env:
