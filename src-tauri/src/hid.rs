@@ -861,6 +861,50 @@ mod imp {
             Err(_) => Err("HID thread exited before reporting status".into()),
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        // A child module, not a sibling of the outer `tests`: `pump_into` is private to
+        // `imp`, and only a child can reach it. That access is the whole point — the
+        // property under test belongs to the transport, not to a helper beside it.
+        use super::*;
+
+        /// Pins the measured hidraw wire shape (see the Linux `imp` module note): a real
+        /// inbound report is 64 bytes led by a literal `0x00`, and reaches the parsers
+        /// RAW. If a future change ever re-adds a report-id fixup, this is the assertion
+        /// that should have stopped it.
+        ///
+        /// Driven through the real [`pump_into`] over a pipe rather than over a buffer
+        /// built in the test: a fixup would live inside `pump_into`, so a test that
+        /// constructs its own report and inspects it can never observe one.
+        #[test]
+        fn a_real_inbound_report_needs_no_report_id_fixup() {
+            // Byte-for-byte head of a report captured from a TMP on fw 1.8.58 (the 0x35
+            // single-frame reply that opens a preset-list harvest), zero-padded to 64.
+            let mut raw = vec![0u8; 64];
+            raw[..4].copy_from_slice(&[0x00, 0x35, 0x00, 0x06]);
+
+            // A pipe is fd-compatible with the poll/read loop and needs no hardware.
+            let mut fds = [0i32; 2];
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe()");
+            let (rd, wr) = (fds[0], fds[1]);
+            let written = unsafe { libc::write(wr, raw.as_ptr() as *const c_void, raw.len()) };
+            assert_eq!(written, 64, "write()");
+            // Close the write end so the pump sees EOF instead of burning its budget.
+            assert_eq!(unsafe { libc::close(wr) }, 0, "close(wr)");
+
+            let mut out = Vec::new();
+            pump_into(rd, 250, &mut out);
+            assert_eq!(unsafe { libc::close(rd) }, 0, "close(rd)");
+
+            // Exactly one report, byte-identical to the wire: no byte stripped, none
+            // inserted, no re-framing.
+            assert_eq!(out, vec![raw.clone()]);
+            // And what came out folds as a CLOSED single frame, so the parsers' own
+            // admission test (`len >= 4 && data[0] == 0x00`) passes on it as-is.
+            assert!(!fold_frame_open(&out, false));
+        }
+    }
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -898,23 +942,6 @@ mod tests {
         assert_eq!(parse_hid_id("DRIVER=hid-generic\n"), None);
         assert_eq!(parse_hid_id("HID_ID=0003:notahex:00000044"), None);
         assert_eq!(parse_hid_id("HID_ID=0003:00001ED8"), None);
-    }
-
-    /// Pins the measured hidraw wire shape (see the Linux `imp` module note): a real
-    /// inbound report is 64 bytes led by a literal `0x00`, and reaches the parsers
-    /// RAW. If a future change ever re-adds a report-id fixup, this is the assertion
-    /// that should have stopped it.
-    #[test]
-    fn a_real_inbound_report_needs_no_report_id_fixup() {
-        // Byte-for-byte head of a report captured from a TMP on fw 1.8.58 (the 0x35
-        // single-frame reply that opens a preset-list harvest), zero-padded to 64.
-        let mut raw = vec![0u8; 64];
-        raw[..4].copy_from_slice(&[0x00, 0x35, 0x00, 0x06]);
-        assert_eq!(raw.len(), 64, "device reports are full-length");
-        // The parsers' own admission test (`len >= 4 && data[0] == 0x00`) passes as-is.
-        assert!(raw.len() >= 4 && raw[0] == 0x00);
-        // And it folds as a CLOSED single frame with no transformation applied.
-        assert!(!fold_frame_open(std::slice::from_ref(&raw), false));
     }
 
     #[test]
