@@ -142,8 +142,15 @@ jobs:
             bunx playwright install chromium
           fi
 
+      # Linux runners are CPU-constrained enough that the default 3-worker offline
+      # suite intermittently blows level-fs-preset24's 240 s test timeout (reproduced
+      # on GitHub's own ubuntu-latest hardware, not just underpowered local boxes);
+      # macos-14 has no such issue at the default worker count. Serializing on Linux
+      # trades CI minutes for reliability rather than touching the shared spec/config.
       - name: Offline e2e (SimDevice)
         run: bun run e2e
+        env:
+          TMP_E2E_WORKERS: ${{ runner.os == 'Linux' && '1' || '' }}
 
   commitlint:
     if: github.event_name == 'pull_request'
