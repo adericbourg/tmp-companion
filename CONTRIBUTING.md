@@ -32,7 +32,7 @@ The app **ships** on macOS. Linux is a supported _development_ platform and part
 
 **Works on Linux:** every gate (`cargo check`/`clippy`/`fmt`/`test --lib`, the whole frontend toolchain, the offline Playwright e2e against `SimDevice`), and real device I/O — connect, preset list, the backup scan.
 
-**Does not work on Linux:** anything needing re-amp, i.e. the **Level and Doctor** tabs. Those capture audio through CoreAudio; the `cpal` code paths compile but `audio.rs` negotiates an `f32` stream, which ALSA does not offer for this class of device. Treat those two tabs as macOS-only for now.
+**Does not work on Linux:** anything needing re-amp, i.e. the **Level and Doctor** tabs. The `cpal` code paths compile, but `audio.rs`'s `pick_config` admits only `SampleFormat::F32` configs — a constraint written against CoreAudio, which is where every re-amp rule in `.claude/rules/danger.md` was measured. Nothing there has been re-measured on Linux: the device's supported `cpal` configs have not been enumerated, and whether PipeWire card ownership breaks the discrete channel routing re-amp depends on is an open question. Both are prerequisites for the work, not conclusions from it. Treat those two tabs as macOS-only for now.
 
 System dependencies (Debian/Ubuntu):
 
@@ -50,9 +50,9 @@ sudo cp packaging/udev/70-fender-tone-master-pro.rules /etc/udev/rules.d/
 sudo udevadm control --reload-rules && sudo udevadm trigger
 ```
 
-`udevadm trigger` re-applies the rule to an already-connected unit, so no replug is needed. Verify with `ls /dev/hidraw*` and `getfacl /dev/hidrawN` — the rule grants the logged-in user access via an ACL, so you should see a `user:<you>:rw-` entry rather than a group change. Sanity-check the connection with `cargo run --bin probe`, which should print your preset list.
+`udevadm trigger` re-applies the rule to an already-connected unit, so no replug is needed. Verify with `ls /dev/hidraw*` and `getfacl /dev/hidrawN` — the rule grants the logged-in user access via an ACL, so you should see a `user:<you>:rw-` entry rather than a group change.
 
-Then follow the build steps above. **Order matters** — `bun run build` must precede any `cargo` command, because `tauri-build`'s `generate_context!` panics when `dist/` is absent, and `dist/` is gitignored.
+Then follow the build steps above. **Order matters** — `bun run build` must precede any `cargo` command, because `tauri-build`'s `generate_context!` panics when `dist/` is absent, and `dist/` is gitignored. Once that build has run, sanity-check the connection with `cargo run --bin probe`, which should print your preset list.
 
 ## Pull requests
 
