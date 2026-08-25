@@ -519,8 +519,32 @@ pub(crate) async fn calibrate_profile(
     secs: f32,
 ) -> Result<CalibrateResult, String> {
     let app2 = app.clone();
+    let settings_path = crate::commands::presets::device_settings_path(&app);
     with_released_seize(state.session.clone(), move || {
-        let (mono, _peak) = crate::probe_api::stimulus::capture_dry_di(secs)?;
+        // #124 pre-flight: the device mixer's USB 3 strip, from the settings snapshot
+        // the startup backup read persisted (`support/device-settings.json`). The
+        // snapshot can be STALE — the mixer may have been touched since connecting —
+        // and the two halves treat that risk DIFFERENTLY on purpose:
+        //
+        // - MUTE only ever EXPLAINS a take that produced nothing. It is handed to
+        //   `capture_dry_di`, which consults it solely on its silent-take path, so a
+        //   take that lands despite a "muted" snapshot is simply a newer mixer state
+        //   and wins. It is deliberately NOT prepended to arbitrary capture errors —
+        //   doing so turned a mid-capture unplug into a confident "USB 3 is MUTED".
+        // - The POST/off-unity FADER does veto a take that landed, because a landed
+        //   take persists the capture as the leveling stimulus (injected verbatim at
+        //   gain 1), so a fader-scaled one corrupts every later re-amp invisibly.
+        //   `usb3_fader_fault` carries the full reasoning and the replug recovery.
+        let strip = settings_path
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|json| crate::backup_read::usb3_strip(&json));
+        let (mono, _peak) = crate::probe_api::stimulus::capture_dry_di(secs, strip.as_ref())?;
+        if let Some(f) = strip
+            .as_ref()
+            .and_then(crate::probe_api::stimulus::usb3_fader_fault)
+        {
+            return Err(f);
+        }
         // Reject a capture that's mostly silence (a valid capture becomes the stimulus,
         // so a few plucks + long gaps would inject a mostly-dead re-amp signal).
         if active_window_fraction(&mono, 48_000) < 0.5 {
