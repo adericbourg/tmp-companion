@@ -20,6 +20,8 @@ Full hardware evidence for the linked entries is in [`notes/gotchas.md`](../../n
 
 - **DANGER** — **A footswitch ROW carrying TWO entries (HW-proven for on-off + param on one switch) makes the firmware silently DISCARD the whole IMPORTED preset at its lazy commit**, substituting an EMPTY body — zero blocks in every lane, all ftsw rows blank, factory-placeholder `info` — under the imported display name (HW bisect, fw 1.8.45, 2026-08-18). Same discard class as the missing-`valueType` clause above, and doubly deceptive downstream: the empty substitute re-amps as clean stimulus passthrough (see the no-blocks trap in `CLAUDE.md`), so every capture reads as one unchanging "preset" no edit can influence. Emit at most ONE entry per ftsw row; single on-off, single param (with `valueType`), and single scene rows are each HW-proven safe in one preset. [→ evidence](../../notes/gotchas.md#a-dual-entry-footswitch-row-makes-the-firmware-silently-replace-the-whole-imported-preset-with-an-empty-body)
 
+- **A batched scene-leveling save can revert the ONE scene it just leveled**, if that scene equals `restore_scene` (the preset's on-load scene, recalled right before the save) — `loadScene(N)` re-instantiates scene N's STORED overlay, discarding N's own unsaved edit. Detected (not silent) by the existing `persist_mismatches` check; HW-reproduced twice, deterministic for any preset whose stored on-load scene is the one a batch levels. [→ evidence](../../notes/gotchas.md#a-batched-scene-leveling-save-can-revert-the-one-scene-it-just-leveled-if-that-scene-is-also-restore_scene--a-pre-existing-platform-agnostic-bug-not-a-linux-audio-defect)
+
 ## Re-amp and measurement
 
 - **DANGER** — **NEVER re-engage re-amp on a held connection** (disengage → settle → re-engage). HW-observed to wedge the device's re-amp **and trigger a USB crash that rebooted the Mac**. `leveller::level_preset` therefore uses **three fresh connections** (load / measure / apply). For SCENE and footswitch leveling only the measurement prepass reconnects (one engage per scene); that path's apply — per-scene `outputLevel` + save, all pure SENDS with no engage — runs on ONE persistent session. Either way the run must still end with a guaranteed re-amp OFF on its own fresh connection. See `notes/protocol.md`.
@@ -46,7 +48,7 @@ Full hardware evidence for the linked entries is in [`notes/gotchas.md`](../../n
 
 - **`outputLevel`=0 is DEEP DIGITAL SILENCE on the real TMP**, and `leveller::loudest_loudness` ERRORS ("no signal captured") on a silent capture — a finite LUFS is not recoverable from silence. [→ evidence](../../notes/gotchas.md#outputlevel0-is-deep-digital-silence-on-the-real-tmp-and-levellerloudest_loudness-errors-no-signal-captured-on-a-silent-capture)
 
-- **48 kHz stimulus required** — that is the **host Core Audio rate** the device must be set to, not "the device clock". [→ evidence](../../notes/gotchas.md#48-khz-stimulus-required)
+- **48 kHz stimulus required** — that is the **host Core Audio rate** the device must be set to, not "the device clock" (macOS). On Linux there is no host-rate-vs-device-clock distinction to misconfigure: `hw:` negotiates the sample rate directly with the hardware (`pick_config`'s `target_rate`), bypassing any system-default-samplerate layer entirely — the TMP's `hw:` interface natively offers 48 kHz among its rates, confirmed HW-measured. [→ evidence](../../notes/gotchas.md#48-khz-stimulus-required)
 
 ## Resources and connections
 

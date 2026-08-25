@@ -26,6 +26,10 @@
 //!   probe --setlists               list every Setlist on the device (names)
 //!   probe --setlist-songs          list the songs each Setlist contains (slots → names)
 //!   probe --activegraph            print the current preset's live signal-chain graph
+//!   probe --audio-devices          NO-DEVICE (HID): enumerate host audio devices (cpal) —
+//!                                  names, exact ALSA PCM id (Linux), channels, rates,
+//!                                  sample formats, and which one find_tmp() would pick.
+//!                                  Linux also prints the /proc/asound Fender-VID card table.
 //!   probe --insert-active <NEW_MODEL_ID> [--group G1] [--after <FENDER_ID>] [--slot N] [--commit]
 //!                                  ADD a block to the device's CURRENT ACTIVE preset via
 //!                                  live insertNode (field 34). No --commit = DRY RUN
@@ -209,12 +213,15 @@ fn main() {
     // Every LUFS this binary printed would then be fabricated but perfectly plausible.
     // `scripts/e2e.sh` builds probe with that feature INTO THE SAME target dir, clobbering
     // the production binary; this has silently invalidated hardware measurements twice.
-    // Fail loudly instead. `--seed-scenario` is the one arm e2e.sh needs and never measures.
+    // Fail loudly instead. `--seed-scenario` is the one arm e2e.sh needs and never measures;
+    // `--audio-devices` only enumerates the host's audio devices, so no capture can be faked.
     #[cfg(feature = "e2e")]
-    let seed_scenario_only =
-        args.get(1).is_some_and(|arg| arg == "--seed-scenario") && args.len() == 2;
+    let capture_free_only = args.len() == 2
+        && args
+            .get(1)
+            .is_some_and(|arg| arg == "--seed-scenario" || arg == "--audio-devices");
     #[cfg(feature = "e2e")]
-    if std::env::var("TMP_E2E_ONLINE").is_err() && !seed_scenario_only {
+    if std::env::var("TMP_E2E_ONLINE").is_err() && !capture_free_only {
         eprintln!(
             "[probe] REFUSING TO RUN: this is an `--features e2e` build without TMP_E2E_ONLINE, \
              so audio captures would be FAKE (stimulus passthrough), not the device.\n\
@@ -227,6 +234,19 @@ fn main() {
         match tmp_companion_lib::probe_active_graph() {
             Ok(graph) => {
                 print!("{graph}");
+                return;
+            }
+            Err(e) => {
+                eprintln!("[probe] FAILED: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if args.iter().any(|a| a == "--audio-devices") {
+        match tmp_companion_lib::probe_audio_devices() {
+            Ok(report) => {
+                print!("{report}");
                 return;
             }
             Err(e) => {

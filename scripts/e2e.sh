@@ -423,6 +423,22 @@ seed_with_retry() { # $1 = pre|mid; returns 0 once seeded, 1 after 4 failed atte
   return 1
 }
 
+# Portable mtime-as-epoch-seconds: BSD `stat -f %m` (macOS) vs GNU `stat -c %Y` (Linux) take
+# INCOMPATIBLE flag meanings for `-f` (BSD: format string; GNU: filesystem status, not file
+# status) — `stat -f %m <file>` on GNU treats `%m` as a SECOND target, fails on it, and its
+# multi-line `-f` fallback output ("  File: ...") gets captured into the idle-rest arithmetic
+# below, which then dies under `set -u` trying to evaluate the bare word `File` as a variable
+# (HW-reproduced on Linux: worked on a fresh stamp file, broke once one already existed).
+# Reports the mtime on stdout and SUCCEEDS, or fails with no output when the timestamp
+# cannot be read — the caller must fail CLOSED on that (see start_online_server), since an
+# unreadable/vanished stamp could mean the device was JUST touched, not that it's very old.
+stamp_mtime() {
+  case "$(uname -s)" in
+    Darwin) stat -f %m "$1" ;;
+    *) stat -c %Y "$1" ;;
+  esac 2>/dev/null
+}
+
 # Rest → seed (pre-server) → settle → start the handshake-verified e2e_server → patch in the
 # seeded presets. Shared by the ordered online spec loop below AND `soak` — this exact
 # device-open-rest-window + seed-race + fail-loud mark-seeded sequence must not drift between
@@ -432,8 +448,14 @@ start_online_server() {
   # touched recently (a run that just ended / an aborted seed) — an attended start
   # minutes later needs no rest at all. The stamp file records the last device op
   # (written by the recovery trap + after each seed); rest only the REMAINDER.
-  local stamp="${TMPDIR:-/tmp/}tmp-companion-device.lastop" idle=999 rest=60
-  if [ -f "$stamp" ]; then idle=$(( $(date +%s) - $(stat -f %m "$stamp" 2>/dev/null || echo 0) )); fi
+  local stamp="${TMPDIR:-/tmp/}tmp-companion-device.lastop" idle=999 rest=60 mtime=""
+  if [ -f "$stamp" ]; then
+    mtime=$(stamp_mtime "$stamp") || mtime=""
+    case "$mtime" in
+      '' | *[!0-9]*) idle=0 ;; # unreadable/vanished stamp → assume the device was JUST touched
+      *) idle=$(( $(date +%s) - mtime )) ;;
+    esac
+  fi
   if [ "$idle" -lt "$rest" ]; then
     log "resting the unit before the first seed ($(( rest - idle )) s — device idle only ${idle}s)…"
     sleep $(( rest - idle ))

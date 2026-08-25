@@ -12,6 +12,7 @@
 pub(crate) const SCRATCH_SLOTS: [u32; 10] = [400, 401, 402, 403, 404, 405, 406, 407, 408, 409];
 
 pub(crate) mod analyze;
+pub(crate) mod audio_devices;
 pub(crate) mod doctor_calib;
 pub(crate) mod doctor_defects;
 pub(crate) mod doctor_inject;
@@ -77,6 +78,7 @@ impl Drop for ReampOffGuard {
     }
 }
 
+pub use audio_devices::*;
 pub use doctor_calib::*;
 pub use doctor_defects::*;
 pub use doctor_inject::*;
