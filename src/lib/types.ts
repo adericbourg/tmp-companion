@@ -156,15 +156,17 @@ export interface LevelResult {
    * Null when the measuring path has no full-capture meter. */
   dynamic_spread_lu: number | null;
   /** Set with `clamped` for the "no authority" case — the amp's outputLevel doesn't
-   * reach the USB 1/2 capture (off-branch / off-USB). Shown verbatim instead of a
-   * generic clamp. Null for the preset-level path / an ordinary headroom clamp. */
+   * reach the USB 1/2 capture (off-branch / off-USB). Not surfaced in the UI (design
+   * 1a shows one generic clamp message regardless of cause); used only to classify
+   * the row as offbranch. Null for the preset-level path / an ordinary headroom clamp. */
   clamp_reason: string | null;
   /** Rebalance "verify by ear": the lane-mute floor was too shallow to trust the
    * equal-solo balance (the overall target still landed). ORed with the spread flag. */
   verify_by_ear: boolean;
-  /** The preset's saved `presetLevel` BEFORE this run wrote it — the revert anchor
-   * for "Restore original". Null when the pre-run read failed or the path doesn't
-   * write `presetLevel` (block-knob / scene rows). */
+  /** The preset's saved `presetLevel` BEFORE this run wrote it — internal re-run
+   * idempotency data (a same-level re-run reloads the stored preset instead of
+   * rewriting it), not surfaced in the UI. Null when the pre-run read failed or the
+   * path doesn't write `presetLevel` (block-knob / scene rows). */
   previous_level: number | null;
   /** PREDICTED true peak (dBTP) at final_level, extrapolated from the reference
    * capture's measured true peak — an ESTIMATE, never a re-measurement. Only the
@@ -177,7 +179,8 @@ export interface LevelResult {
   /** The clamp's CAUSE from the shared taxonomy (mirrors `headroom_trade::ClampKind`) —
    * null when the row is not clamped. Additive alongside `clamp_reason`, whose contract
    * ("the leveled signal isn't reaching USB 1/2") is unchanged: this is the
-   * machine-readable cause. Render its `CLAMP_MESSAGES[kind]` verbatim — never re-word it. */
+   * machine-readable cause. Wire-only: design 1a's UI no longer surfaces it — every
+   * clamped row shows one generic message regardless of cause. */
   clamp_kind: ClampKind | null;
   /** THE HEADROOM TRADE this run made (or, on a preview, WOULD make) — see `TradeSummary`.
    * Stamped on EVERY row of a batch that traded (the trade moved the whole preset's gain
@@ -205,24 +208,6 @@ export type ClampKind =
   | "trade_floor"
   | "partial_trade"
   | "no_authority";
-
-/** One user-facing sentence per `ClampKind` — the UI's OWN copy for the backend's clamp
- * taxonomy (keyed by `ClampKind`, mirrors `headroom_trade::ClampKind`). This is a SEPARATE
- * wording from `ClampKind::message()`, whose only caller builds an internal Rust error
- * string; nothing cross-checks the two, so a taxonomy change on the backend does not fail
- * loudly here — update this table by hand alongside it. */
-export const CLAMP_MESSAGES: Record<ClampKind, string> = {
-  scene_ceiling:
-    "this sound can’t reach the target because its level control is already maxed out",
-  wet_floor:
-    "this sound can’t reach the target without turning the effect’s mix down too far to still work",
-  trade_floor:
-    "giving this sound headroom used up the base amp’s spare room, so the base sound slipped off target",
-  partial_trade:
-    "a related write failed, so the headroom trade was undone and nothing was saved",
-  no_authority:
-    "this level control has no effect on the sound coming out of USB 1/2",
-};
 
 /** Why a headroom-trade raise was trimmed below what the worst benefiting deficit wanted
  * (mirrors `headroom_trade::TradeCap`, snake_case). */

@@ -310,7 +310,8 @@ pub(crate) async fn level_preset<R: tauri::Runtime>(
                 // yields a short force list — pedals left on, and the wrong `presetLevel` SAVED.
                 // `read_slot_preset_complete` re-reads off a device backup when a required
                 // section is truncated, so an unreadable `ftsw` REFUSES instead of guessing.
-                // The same read still supplies the revert anchor and the save's `restore_scene`.
+                // The same read still supplies `previous_level` (the idempotency-skip anchor,
+                // not a user-facing revert) and the save's `restore_scene`.
                 let preset = match read_slot_preset_complete(slot, &["ftsw"]) {
                     Ok((preset, _, _)) => preset,
                     // Returns BEFORE the run-end `reamp_off_guaranteed` backstop, which is safe
@@ -358,11 +359,11 @@ pub(crate) async fn level_preset<R: tauri::Runtime>(
                 )
             }
         };
-        // The revert anchor rides the result (Summary "Restore original"). In-memory
-        // only: a restart-surviving restore is a follow-up that ships WITH its reader UI.
-        // Only staple when this run actually SAVED (and the leveller left it unset) —
-        // the leveller returns `previous_level: None` itself both for its own idempotency
-        // skip AND the no-signal clamp, and neither has anything worth "restoring".
+        // `previous_level` rides the result for the re-run idempotency skip (see
+        // `level_unchanged`) — not a user-facing revert; design 1a has no in-app restore
+        // of any kind. Only staple when this run actually SAVED (and the leveller left it
+        // unset) — the leveller returns `previous_level: None` itself both for its own
+        // idempotency skip AND the no-signal clamp, and neither has anything to staple.
         let result = result.map(|mut r| {
             if r.saved && r.previous_level.is_none() {
                 r.previous_level = previous_level;
@@ -400,27 +401,6 @@ pub(crate) fn cancel_preset_leveling() {
     crate::request_op_abort();
 }
 
-/// Restore a preset's `presetLevel` to its pre-leveling snapshot value (the
-/// Summary "Restore original" action). A device WRITE (set + save), serialized
-/// and seize-released like every leveling write. `presetLevel` only — scene and
-/// footswitch `outputLevel` writes are not revertable from here (UI copy says so).
-/// `expected_name` is the display name the run recorded for the slot; the write
-/// is refused if the preset list drifted and the slot now holds a different preset.
-#[tauri::command]
-pub(crate) async fn restore_preset_level(
-    state: State<'_, AppState>,
-    slot: u32,
-    level: f32,
-    expected_name: String,
-) -> Result<(), String> {
-    with_released_seize(state.session.clone(), move || {
-        log::info!(
-            "restore_preset_level slot={slot} level={level:.4} expected=\"{expected_name}\""
-        );
-        leveller::restore_preset_level(slot, level, &expected_name)
-    })
-    .await
-}
 /// What one Tier-2 calibration measured, plus its quality caveats.
 /// Mirrored in `src/lib/types.ts` (`CalibrateResult`).
 #[derive(Debug, Clone, Serialize)]
