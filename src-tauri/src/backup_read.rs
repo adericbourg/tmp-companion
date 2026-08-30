@@ -22,6 +22,20 @@ pub struct BackupPresetRow {
     /// Device user slot (DB `slot`; = list index + 1).
     pub slot: i64,
     pub name: String,
+    /// The preset doc's identity uuid (`info.preset_id`), parsed from the SAME
+    /// `presetJson` every other field on this row comes from. The ONLY stable
+    /// identity a cross-connection lookup can key on — slot is positional and
+    /// `displayName` is user-editable and duplicable (`slot_write.rs`'s
+    /// preset_id-over-displayName precedent — which REFUSES outright on an absent
+    /// id; this row's callers instead warn-and-accept on slot+name alone, a
+    /// deliberate divergence, since a user-facing read refusing here would
+    /// re-break the Hiwatt truncated-read case `slot_read.rs`'s cut-order note
+    /// documents). `None` for an unparseable row, for a
+    /// body without the key, or for an EMPTY id — normalized away at the
+    /// `crate::library::preset_id_of` chokepoint so a `Some("")` can never compare
+    /// equal to another `Some("")` and pass a guard vacuously (the hazard
+    /// `lib.rs`'s fixture gates document).
+    pub preset_id: Option<String>,
     /// Number of scenes (`scenes.len()`); `-1` if the `presetJson` could not be
     /// parsed (full plaintext doc, so this is rare).
     pub scene_count: i64,
@@ -449,14 +463,27 @@ fn extract_backup_entries(blob: &[u8]) -> Result<BackupEntries, String> {
 /// document.
 ///
 /// `device_slot` is the DB `slot` = list index + 1 (see [`BackupPresetRow::slot`]).
-/// NAME-GUARDED (danger.md's address-space rule): the caller states the name it expects
-/// at that slot and the row is refused on a mismatch, because a second connection sits
-/// between whatever read the name and this backup transfer — a preset body silently
-/// taken from the WRONG slot would drive writes and a save against the wrong preset.
+/// IDENTITY-GUARDED (danger.md's address-space rule): the caller states the slot,
+/// the name it expects there, and — when its own partial could name one —
+/// `expect_id` (the partial's `info.preset_id`, per `crate::library::preset_id_of`).
+/// The row is refused on a name mismatch, and again on an `expect_id` mismatch or a
+/// body with no id when one was expected: a second connection sits between whatever
+/// named the slot and this backup transfer, and a preset body silently taken from the
+/// WRONG slot would drive writes and a save against the wrong preset. Section key
+/// order is alphabetical (`ftsw` < `info` < `scenes`), so for a caller whose
+/// `required` sections sort before `info` (the common ftsw-cut shape — see
+/// `slot_read.rs`'s cut-order note), a triggering cut ALWAYS takes `info` too,
+/// leaving `expect_id` systematically `None` and the identity check skipped
+/// (logged) in favor of the slot+name guards alone; a scenes-cut keeps `info`
+/// intact, so the id branch is live on that shape. Empty strings are normalized
+/// to `None` on both sides before the comparison — never compared as an
+/// empty-string default (see `BackupPresetRow::preset_id`'s
+/// own doc for the vacuous-pass hazard this avoids).
 pub(crate) fn preset_json_from_backup(
     blob: &[u8],
     device_slot: i64,
     expect_name: &str,
+    expect_id: Option<&str>,
 ) -> Result<serde_json::Value, String> {
     let entries = extract_backup_entries(blob)?;
     let rows = run_sql(
@@ -465,16 +492,23 @@ pub(crate) fn preset_json_from_backup(
             "SELECT slot, displayName, presetJson FROM UserPresets WHERE slot = {device_slot}"
         ),
     )?;
-    backup_row_preset_json(&rows, device_slot, expect_name)
+    backup_row_preset_json(&rows, device_slot, expect_name, expect_id)
 }
 
-/// [`preset_json_from_backup`]'s decision, split out so the name guard is testable with
-/// no archive in the loop: take the row for `device_slot` and refuse it unless it still
-/// names `expect_name`. Pure.
+/// [`preset_json_from_backup`]'s decision, split out so the name + identity guards are
+/// testable with no archive in the loop: take the row for `device_slot`, refuse it
+/// unless it still names `expect_name`, parse its body, and — when `expect_id` is
+/// `Some` — refuse again unless the parsed body's `info.preset_id` matches it. Pure.
+/// `got_id` here comes from a STRICT `serde_json::from_str` of the row body at guard
+/// time, while [`BackupPresetRow::preset_id`] upstream comes from the TOLERANT parse
+/// (`session::tolerant_parse_json`) — the two can't disagree today, since an
+/// unparseable body fails this function's own strict parse first and never reaches
+/// the `got_id` comparison, but the alignment is worth stating.
 fn backup_row_preset_json(
     rows: &serde_json::Value,
     device_slot: i64,
     expect_name: &str,
+    expect_id: Option<&str>,
 ) -> Result<serde_json::Value, String> {
     let row = rows
         .as_array()
@@ -494,8 +528,36 @@ fn backup_row_preset_json(
         .get("presetJson")
         .and_then(|v| v.as_str())
         .ok_or_else(|| format!("backup row for device slot {device_slot} carries no presetJson"))?;
-    serde_json::from_str(js)
-        .map_err(|e| format!("backup presetJson for device slot {device_slot} did not parse: {e}"))
+    let doc: serde_json::Value = serde_json::from_str(js).map_err(|e| {
+        format!("backup presetJson for device slot {device_slot} did not parse: {e}")
+    })?;
+
+    let expect_id = expect_id.filter(|s| !s.is_empty());
+    let got_id = crate::library::preset_id_of(&doc);
+    match (expect_id, got_id) {
+        (Some(want), Some(got)) if want != got => {
+            return Err(format!(
+                "backup row for device slot {device_slot} (named {expect_name:?}) carries \
+                 preset_id {got:?}, not the expected {want:?} — the slot's occupant changed \
+                 between the two reads; refusing to read a preset body from a slot that moved"
+            ));
+        }
+        (Some(want), None) => {
+            return Err(format!(
+                "backup row for device slot {device_slot} (named {expect_name:?}) carries no \
+                 info.preset_id, but {want:?} was expected — refusing an unidentifiable body \
+                 on a path that feeds writes and a save"
+            ));
+        }
+        (Some(_), Some(_)) => {}
+        (None, _) => {
+            log::warn!(
+                "backup row for device slot {device_slot} (named {expect_name:?}): no \
+                 preset_id to expect — identity check skipped, accepted on slot+name alone"
+            );
+        }
+    }
+    Ok(doc)
 }
 
 /// Decode a streamed device backup archive (GNU-tar + LZ4-frame) IN MEMORY and read
@@ -704,6 +766,10 @@ pub fn read_backup_archive(blob: &[u8]) -> Result<BackupReadResult, String> {
         presets.push(BackupPresetRow {
             slot: r.get("slot").and_then(|v| v.as_i64()).unwrap_or(-1),
             name: name.to_string(),
+            preset_id: parsed_graph
+                .as_ref()
+                .and_then(|g| crate::library::preset_id_of(g))
+                .map(str::to_string),
             scene_count,
             scenes,
             amp_candidates,
