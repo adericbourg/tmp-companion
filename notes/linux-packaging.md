@@ -82,6 +82,12 @@ resolve-version (ubuntu)              semantic-release --dry-run → next versio
         release (macos-14)            downloads both bundles, runs the real semantic-release
 ```
 
+`resolve-version` needs `permissions: contents: write` despite writing nothing:
+semantic-release runs `verifyAuth` — a `git push --dry-run … HEAD:main` — before it
+branches on `--dry-run`, so a read-only `GITHUB_TOKEN` 403s and the run dies with
+`EGITNOPERMISSION` instead of printing a version. That is how this job failed on its very
+first run on `main`, and it is not visible from the `--dry-run` flag alone.
+
 Both Linux build jobs are `continue-on-error`, so a broken Linux bundle never blocks the
 signed, notarized macOS DMG — the release still ships, just without that platform's
 artifact. That non-blocking design is why a Linux-bundling job also runs in `ci.yml` on

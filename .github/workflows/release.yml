@@ -35,10 +35,18 @@ jobs:
   # a genuine crash — so a nonzero exit here is treated as a real error, and "no
   # release due" is read from the ABSENCE of the "next release version is …" log
   # line rather than from the exit code.
+  #
+  # `contents: write` even though this job writes NOTHING: semantic-release runs
+  # verifyAuth (`git push --dry-run … HEAD:main`) unconditionally, BEFORE its
+  # dry-run branch, so a read-only GITHUB_TOKEN gets a 403 and the whole run dies
+  # with EGITNOPERMISSION — which is exactly what happened on the first real run
+  # of this job (#173). Dry-run still skips tag creation, the real push and every
+  # publish plugin, so the elevated token is only ever spent on that dry-run push
+  # probe and the GitHub plugin's read-only permission check.
   resolve-version:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
