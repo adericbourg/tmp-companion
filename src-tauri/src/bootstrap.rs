@@ -344,7 +344,12 @@ pub fn run() {
             // platforms need different content, and the plan keeps that
             // divergence in one testable place.
             let mut submenus = Vec::new();
-            for (title, entries) in menu_plan(cfg!(not(target_os = "macos"))) {
+            // `target_os = "linux"`, not `not(macos)`: muda's Windows backend
+            // has no `is_item_supported` gate and draws Quit/Undo/Redo/Window
+            // fine, so the in-flight Windows port must NOT inherit the stripped
+            // plan. GTK is also muda's BSD backend, but this crate's hidraw and
+            // ALSA transports are Linux-only, so a BSD build cannot reach a menu.
+            for (title, entries) in menu_plan(cfg!(target_os = "linux")) {
                 let mut sub = SubmenuBuilder::new(handle, *title);
                 for entry in *entries {
                     sub = add_entry(sub, *entry, &about);
@@ -574,6 +579,10 @@ mod menu_tests {
                 Entry::Fullscreen,
                 Entry::CloseWindow,
             ],
+        );
+        assert_eq!(
+            menu_plan(APPKIT)[3].1,
+            [Entry::Custom(REPORT_BUG_ID, "Report a Bug…")],
         );
     }
 }
