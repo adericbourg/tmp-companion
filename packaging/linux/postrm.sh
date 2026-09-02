@@ -8,10 +8,16 @@
 # or chroot has no running udev, and that must not fail the package removal.
 # POSIX sh — deb and rpm both invoke this with /bin/sh, not bash.
 #
-# No `udevadm trigger` here: on removal there is nothing to re-apply, and a
-# reload alone is enough to drop the departed rule.
+# The trigger is NOT redundant with the reload. A reload updates udevd's rule
+# set for FUTURE events only; it does not re-evaluate devices that are already
+# present, so a unit still plugged in at uninstall keeps the `uaccess` ACL the
+# departed rule gave it until something replays its uevent. That is the same
+# mechanism postinst.sh relies on in the opposite direction — it triggers so an
+# already-connected unit GAINS access without a replug — so removal needs the
+# mirror image, or access outlives the package that granted it.
 set -e
 
 if command -v udevadm >/dev/null 2>&1; then
   udevadm control --reload-rules || true
+  udevadm trigger --subsystem-match=hidraw || true
 fi

@@ -97,7 +97,9 @@ reads that size out of each PNG's IHDR rather than trusting the path — a file
 named and placed correctly but rendered at the wrong size is the same defect
 wearing a disguise, and a path-only check would pass it.
 
-The removal half is a gate too: `postrm.sh` reloads udev after the rule is gone, and
+The removal half is a gate too: `postrm.sh` reloads udev AND re-triggers hidraw after the rule is
+gone — a reload alone updates only future events, so a unit still plugged in at uninstall would keep
+the `uaccess` ACL the departed rule gave it (the mirror of why `postinst.sh` triggers), and
 a non-zero exit there would leave the package half-removed. Set `PAYLOAD_ROOT` to an
 unpacked package tree to run the check locally without installing anything.
 
