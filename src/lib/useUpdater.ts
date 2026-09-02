@@ -27,10 +27,11 @@ export interface UpdaterApi {
   /** The running app's version (from `appInfo()`). */
   currentVersion: string | null;
   /**
-   * Whether this build has an update channel to check at all. False on Linux:
-   * `scripts/latest-json.mjs` emits only `darwin-aarch64`/`darwin-x86_64`, so a
-   * Linux check can only ever come back empty — which the UI would otherwise
-   * present as "up to date" forever. Null until `appInfo()` resolves.
+   * Whether this build has an update channel to check at all. True on macOS
+   * only: `scripts/latest-json.mjs` emits `darwin-aarch64`/`darwin-x86_64` and
+   * nothing else, so a check from any other platform can only ever come back
+   * empty — which the UI would otherwise present as "up to date" forever.
+   * Null until `appInfo()` resolves.
    */
   hasUpdateChannel: boolean | null;
   setAutoInstall: (on: boolean) => void;
@@ -118,8 +119,11 @@ export function useUpdater(): UpdaterApi {
         const info = await appInfo();
         if (gone()) return;
         setCurrentVersion(info.version);
-        // Only macOS has keys in latest.json — see `hasUpdateChannel`.
-        const channel = info.os !== "linux";
+        // A positive allow-list, not `!== "linux"`: latest.json carries only
+        // darwin-* keys, so every OTHER platform — Windows included — is
+        // channel-less too, and a negative check would silently opt each new
+        // one in and reproduce this same bug there.
+        const channel = info.os === "macos";
         setHasUpdateChannel(channel);
         let auto = false;
         try {

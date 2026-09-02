@@ -192,6 +192,41 @@ describe("useUpdater — dev-build guard", () => {
   });
 });
 
+// latest.json carries darwin-* keys and nothing else, so macOS is the only
+// platform with a channel. This is an allow-list rather than "not linux"
+// precisely so a new target (the in-flight Windows port) does not silently
+// inherit the permanent "up to date" bug this guard exists to prevent.
+describe("useUpdater — update-channel allow-list", () => {
+  it("reports a channel on macOS and checks on mount", async () => {
+    h.appInfo.mockResolvedValue(info("1.0.0", "macos"));
+    h.checkForUpdate.mockResolvedValue(null);
+
+    const { result } = renderHook(() => useUpdater());
+    await waitFor(() => {
+      expect(result.current.hasUpdateChannel).toBe(true);
+    });
+    expect(h.checkForUpdate).toHaveBeenCalled();
+  });
+
+  it.each(["linux", "windows"])(
+    "reports no channel on %s and never checks",
+    async (os) => {
+      h.appInfo.mockResolvedValue(info("1.0.0", os));
+
+      const { result } = renderHook(() => useUpdater());
+      await waitFor(() => {
+        expect(result.current.hasUpdateChannel).toBe(false);
+      });
+      // Settle the mount effect, then assert the pointless round-trip never ran.
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(h.checkForUpdate).not.toHaveBeenCalled();
+      expect(result.current.phase).toBe("idle");
+    },
+  );
+});
+
 describe("useUpdater — manual check()", () => {
   it("returns found and transitions to available", async () => {
     const u = mkUpdate("1.1.0", null);
