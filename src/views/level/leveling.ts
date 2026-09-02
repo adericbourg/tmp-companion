@@ -16,6 +16,7 @@
 // commit) → run (steps the chosen scenes) → summary.
 
 import type {
+  BaseBoostSummary,
   FootswitchInfo,
   LevelJob,
   LevelParamCandidate,
@@ -384,6 +385,46 @@ export interface SetupChoice {
   targetName: string;
 }
 
+/** A row's position in its preset's DEPENDENCY order — each rank writes a control the
+ *  ranks below it render through, so running them in any other order shifts rows that
+ *  are already on target:
+ *
+ *  - `0` Base: `presetLevel`, a global multiplier over every other row.
+ *  - `1` Footswitch in BASE context (`sceneContext == null`): its handle is often a block
+ *    the preset leaves ON in base, and a scene renders its whole base chain, so this
+ *    base-space write moves every scene. It must land before the scenes it moves.
+ *  - `2` Scene: a per-scene amp `outputLevel` overlay, scene-local — it moves nothing that
+ *    any other row renders through.
+ *  - `3` Footswitch in SCENE context (`sceneContext != null`): measured with its context
+ *    scene recalled, so it cannot be solved until that scene is on target. `ftswStates`
+ *    naming that scene means the switch is ON in the scene's recorded state, so the scene
+ *    pass has already put this exact sound on target and the row measures in-tolerance and
+ *    skips its write.
+ *
+ *  Rank order: 0 base, 1 base-context footswitch, 2 scene, 3 scene-context footswitch — the
+ *  split is per-row, not "all footswitches early" or "all footswitches late". HW evidence
+ *  (the online 410 arc) is in `notes/gotchas.md`'s "A scene renders the base chain's ON
+ *  blocks" entry.
+ *
+ *  `chosenFrom` emits this order; `useLevelingFlow` sorts by it so the run holds
+ *  regardless of how its items were assembled. */
+export function runRank(it: {
+  isBase: boolean;
+  footswitch?: unknown;
+}): 0 | 1 | 2 | 3 {
+  if (it.isBase) return 0;
+  const fs = it.footswitch;
+  if (fs == null) return 2;
+  // Only a NUMERIC context ranks late: absent, `null` and an unresolved `undefined` all
+  // mean base context, the conservative side (a truthiness test would mis-read scene 0).
+  // `unknown` + probe rather than a typed field: the two callers pass genuinely different
+  // shapes (a full `FootswitchTarget`, and a bare object with no `sceneContext` at all —
+  // which the gate below exists to pin), and no single object type accepts both.
+  const ctx =
+    typeof fs === "object" && "sceneContext" in fs ? fs.sceneContext : null;
+  return typeof ctx === "number" ? 3 : 1;
+}
+
 /** Resolve the scene keys SELECTED in the list into the setup rows to configure.
  *  Walks every non-empty preset (sorted, Base-first) and emits a SetupOption for
  *  each of its keys present in `sel`. Everything returned WILL be leveled — the
@@ -416,24 +457,16 @@ export function chosenFrom(
           hasScenes: hasChildren,
         });
       }
-      scenes.forEach((sc, i) => {
-        if (sel.has(sceneKeyOf(r.slot, i))) {
-          items.push({
-            key: sceneKeyOf(r.slot, i),
-            slot: r.slot,
-            presetName: r.name,
-            isBase: false,
-            sceneSlot: i, // the row index IS the 0-based wire sceneSlot
-            sceneName: sc.name,
-            tag: sc.fs != null ? `FS${String(sc.fs)}` : "—",
-            hasScenes: true,
-          });
-        }
-      });
+      // Emitted in `runRank` order — Base, BASE-CONTEXT footswitches, scenes, then
+      // SCENE-CONTEXT footswitches. Rather than restate that order as separate passes, the
+      // preset's rows are built once and sorted through `runRank` itself, which owns the rule
+      // and carries the HW evidence for both halves of the split. The sort is stable, so each
+      // switch keeps its ORIGINAL index in `fswKey` and scenes keep their wire order.
+      const children: SetupOption[] = [];
       footswitches.forEach((f, i) => {
         const target = footswitchTarget(f);
         if (target && sel.has(fswKey(r.slot, i))) {
-          items.push({
+          children.push({
             key: fswKey(r.slot, i),
             slot: r.slot,
             presetName: r.name,
@@ -449,6 +482,22 @@ export function chosenFrom(
           });
         }
       });
+      scenes.forEach((sc, i) => {
+        if (sel.has(sceneKeyOf(r.slot, i))) {
+          children.push({
+            key: sceneKeyOf(r.slot, i),
+            slot: r.slot,
+            presetName: r.name,
+            isBase: false,
+            sceneSlot: i, // the row index IS the 0-based wire sceneSlot
+            sceneName: sc.name,
+            tag: sc.fs != null ? `FS${String(sc.fs)}` : "—",
+            hasScenes: true,
+          });
+        }
+      });
+      children.sort((a, b) => runRank(a) - runRank(b));
+      items.push(...children);
     });
   return items;
 }
@@ -541,6 +590,11 @@ export interface RunItem {
    *  no ceiling): the run loop leaves the row's existing outcome untouched so it stays
    *  visible/counted in the Summary without wasting a re-capture on a signal-less sound. */
   skipRelevel?: boolean;
+  /** Base rows only: this row's base-pair BOOST disclosure, carried verbatim from the
+   *  result's `base_boost` — see `BaseBoostSummary`'s own doc. `null`/undefined on every
+   *  row whose base pair never entered the `Boost` regime (the common case) and on every
+   *  non-base row. */
+  baseBoost?: BaseBoostSummary | null;
 }
 
 /** A finished row's MEASURED raw ceiling for the reachable-common-target derivation, or null

@@ -189,6 +189,12 @@ export interface LevelResult {
    * structure, not one row's). Null on every untraded run and on every lane that has no
    * trade (base, block, footswitch). */
   trade: TradeSummary | null;
+  /** THE BASE-PAIR BOOST this run made (or, when it couldn't apply one, WHAT IT WOULD
+   * MAKE) — see `BaseBoostSummary`. Phase 2 of the plumes/BD2/OCD-class regression fix:
+   * base's OWN `presetLevel`/amp-fader pair. Null on every run whose base pair never
+   * entered the `Boost` regime, and on every lane that isn't the base row (block,
+   * footswitch, scene). */
+  base_boost: BaseBoostSummary | null;
 }
 
 /** WHICH sound a trade row / clamp error describes (mirrors `headroom_trade::SoundId`,
@@ -224,8 +230,12 @@ export interface TradeAmpMove {
   parameter_id: string;
   /** The `outputLevel` the preset carried BEFORE the trade — the Restore anchor. */
   previous_value: number;
-  /** The SOLVED value the hold landed on. Null on an advisory: the fader response isn't
-   * algebraically predictable, so a run that didn't actually solve it invents nothing. */
+  /** The SOLVED value the hold landed on. Null on a TRADE advisory: the fader response
+   * isn't algebraically predictable, so a run that didn't actually solve it invents
+   * nothing. Exception: a BOOST advisory (`BaseBoostSummary.applied === false`) populates
+   * this with the planner's SEED (`fader_target`) instead — not a solved prediction, but
+   * the disclosure sentence needs a concrete number even before any closed-loop solve has
+   * run (see `BaseBoostSummary`'s own doc). */
   value: number | null;
 }
 
@@ -246,6 +256,30 @@ export interface TradeSummary {
   cap: TradeCap | null;
   /** The sounds the raise was bought for, by identity. */
   benefiting: SoundId[];
+}
+
+/** A BASE-PAIR BOOST disclosure (mirrors `headroom_trade::BaseBoostSummary`, snake_case —
+ * see `TradeSummary`'s doc for the layer rule). Phase 2 of the plumes/BD2/OCD-class
+ * regression fix: base's OWN `presetLevel`/amp-fader pair — `presetLevel` pinned at its
+ * ceiling and the base amp's fader RAISED to close what's left, because base has no
+ * benefiting-row deficit to redistribute against (it IS the row that's short).
+ *
+ * Same `applied` discriminator as `TradeSummary`:
+ * - `true` — the pair was solved and (on a save run) persisted; `base_amps[0].value` is the
+ *   solved fader.
+ * - `false` — ADVISORY. The plan calls for a boost but this run's shape can't apply it this
+ *   cycle (no `save`, or a scene preset — v1 scopes the full continuation to scene-less
+ *   presets only), so the row still clamps honestly at `presetLevel`'s ceiling and
+ *   `base_amps[0].value` is the planner's SEED (`fader_target`), not a solved prediction — see
+ *   `TradeAmpMove.value`'s own doc for why a BOOST advisory is the one case that populates
+ *   this field instead of leaving it `null`. */
+export interface BaseBoostSummary {
+  applied: boolean;
+  /** The raised `presetLevel` — exact either way, so an advisory can state it without
+   * measuring. */
+  preset_level: number;
+  /** The base amp candidate the boost moves. Exactly one element. */
+  base_amps: TradeAmpMove[];
 }
 
 /** Result of leveling one block-acting footswitch's engaged state

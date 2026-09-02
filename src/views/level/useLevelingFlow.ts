@@ -43,6 +43,7 @@ import {
   optionToRunItem,
   resolvedTargetLufs,
   runItemToOption,
+  runRank,
   type RunItem,
   type SetupOption,
   type SetupChoice,
@@ -323,13 +324,9 @@ export function useLevelingFlow({
       const isCancelled = () => cancelRef.current;
       const candCache = new Map<number, Candidate[]>();
       const work = items.map((it) => ({ ...it }));
-      // Base-first within each preset: a preset's Base levels `presetLevel` — a global
-      // multiplier over its scenes — so it MUST run before its FS scenes, else the base
-      // write shifts every already-leveled scene off-target. `chosenFrom` already emits
-      // this order; this stable sort (0 for differing slots ⇒ input order preserved)
-      // guarantees it regardless of how `items` was assembled.
-      const baseRank = (it: RunItem) => (it.isBase ? 0 : 1);
-      work.sort((a, b) => (a.slot === b.slot ? baseRank(a) - baseRank(b) : 0));
+      // Dependency order documented on `runRank`. Stable sort (0 for differing slots ⇒
+      // input order preserved) guarantees it regardless of how `items` was assembled.
+      work.sort((a, b) => (a.slot === b.slot ? runRank(a) - runRank(b) : 0));
       const total = work.length;
 
       // `work` is mutated in place between publishes; pass a fresh ARRAY each time
@@ -540,6 +537,7 @@ export function useLevelingFlow({
               it.spreadLu = res.dynamic_spread_lu;
               it.truePeakDbtp = res.true_peak_dbtp;
               it.verifyByEar = causeOf(res);
+              it.baseBoost = res.base_boost;
             } else {
               // A scene item with no wire slot — nothing to level.
               it.outcome = "skipped";

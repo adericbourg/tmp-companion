@@ -55,7 +55,7 @@ pub(crate) struct SceneHandleArg {
     parameter_id: String,
 }
 
-/// A1 — "the base anchor" (PR A design doc): keeps the batch's force-appended base job alive
+/// "The base anchor": keeps the batch's force-appended base job alive
 /// through PHASE 1 (prepass) and PHASE 2 (trade) with NO wire scene job of its own, so the
 /// headroom trade can be planned/executed even though the wizard levels base itself through
 /// the separate `level_preset` lane. Stripped before PHASE 3 — base's own `outputLevel` is
@@ -700,7 +700,8 @@ pub(crate) async fn level_scenes_apply_batched<R: tauri::Runtime>(
             // DARK: overlay path validated by `probe --overlay-ab` (76/76 scene-amp pairs,
             // 0 bypass mismatches) but adoption is a gated follow-up — flip to `true` then
             // (see prepass_scene_docs_via's adoption-time TODO). `false` = live prepass today.
-            let (docs, restore_scene) = prepass_scene_docs_via(slot, &scene_slots, false)?;
+            let (docs, restore_scene) =
+                prepass_scene_docs_via(slot, &scene_slots, false, saved.as_ref())?;
             // Inter-session HID gap: the prepass session has just closed; the one-shot
             // runner opens a fresh one. Reuse the leveller's HW-proven open-after-close
             // gap (was a hard-coded 800, copied from the bench). build_scene_jobs below
@@ -1617,6 +1618,8 @@ fn outcome_to_level_result(
         // `scene_progress_item`'s doc for why the channel items need it too, not just the
         // awaited return vec.
         trade: trade.cloned(),
+        // Only `level_preset`'s base arm plans a boost (`level_preset_impl`'s v1 routing gate).
+        base_boost: None,
     }
 }
 

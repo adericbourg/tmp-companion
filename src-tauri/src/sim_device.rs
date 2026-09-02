@@ -217,6 +217,13 @@ pub enum SimEvent {
     /// engage (`danger.md`), so "the write happened" and "the write was heard" are different
     /// facts and only the order tells them apart.
     ReAmp(bool),
+    /// `Session::heartbeat` — a pure fire-and-forget keep-alive send with no reply, the ONLY
+    /// caller of `HidTransport::send` (as opposed to `transact`/`transact_chunked`). Recorded
+    /// so a naked-gap-breaker choreography (`capture_on_session`, `measure_scene_asis`,
+    /// `arm_pair_measurement`'s zero-write base arm) can assert that a heartbeat actually
+    /// landed between the last write and the engage — the structural fact `danger.md`'s
+    /// naked-gap rule rests on.
+    Heartbeat,
 }
 
 struct SimState {
@@ -272,6 +279,10 @@ struct SimState {
     /// [`SimDevice::with_saved_scene`] seeds it directly for a test that doesn't want to
     /// drive a save first.
     saved_scene: HashMap<u32, Option<u32>>,
+    /// Gate seam: while scene `.0` is active, field-3 pushes are cut at the first byte of `.1`.
+    /// Field-8 stays whole — it is what `scene_jobs::backfill_scene_docs_from_saved` repairs from.
+    #[cfg(all(test, feature = "e2e"))]
+    truncated_scene_push: Option<(u32, String)>,
     /// The last `setPresetLevel` — the linear global multiplier the model shifts by
     /// `20·log10`. PLAIN (non-e2e) BUILD: a real `loadPreset` restores the slot's SAVED
     /// presetLevel, but this sim tracks no per-slot saved value here, so it just
@@ -430,6 +441,8 @@ impl Default for SimState {
             current_slot: 0,
             current_scene: None,
             saved_scene: HashMap::new(),
+            #[cfg(all(test, feature = "e2e"))]
+            truncated_scene_push: None,
             preset_level: 1.0,
             param_writes: HashMap::new(),
             bypass_writes: HashMap::new(),
@@ -1041,6 +1054,15 @@ impl SimDevice {
     pub fn with_commit_latency(self, ms: u64) -> SimDevice {
         self.state.lock().expect("sim lock").commit_latency_override =
             Some(std::time::Duration::from_millis(ms));
+        self
+    }
+
+    /// `cut_before` = the first amp node id drops every amp, and — `BTreeMap` keys, `guitarNodes`
+    /// before `template` — that scene's routing template with them.
+    #[cfg(all(test, feature = "e2e"))]
+    pub fn with_truncated_scene_push(self, scene: u32, cut_before: &str) -> SimDevice {
+        self.state.lock().expect("sim lock").truncated_scene_push =
+            Some((scene, cut_before.to_string()));
         self
     }
 
@@ -2161,6 +2183,30 @@ fn node_output_level(node: &serde_json::Value) -> Option<f32> {
         .map(|v| v as f32)
 }
 
+/// Keyed on the ACTIVE scene, not the recall that selected it: the `currentPresetDataRequest`
+/// re-push mid-prepass must be cut too, or it heals the scene the seam exists to break.
+#[cfg(all(test, feature = "e2e"))]
+fn truncate_scene_push(st: &SimState, json: Vec<u8>) -> Vec<u8> {
+    let Some((scene, marker)) = st.truncated_scene_push.as_ref() else {
+        return json;
+    };
+    if st.current_scene != Some(*scene) {
+        return json;
+    }
+    match json
+        .windows(marker.len())
+        .position(|w| w == marker.as_bytes())
+    {
+        Some(at) => json[..at].to_vec(),
+        None => json,
+    }
+}
+
+#[cfg(not(all(test, feature = "e2e")))]
+fn truncate_scene_push(_st: &SimState, json: Vec<u8>) -> Vec<u8> {
+    json
+}
+
 /// The field-3 graph a `loadPreset`/`loadScene` echoes for slot `slot0`. For a SCENARIO slot
 /// (e2e) it echoes that slot's REAL presetJson, `presetLevel` PLUS any baked footswitch
 /// param patched to the slot's COMMITTED lazy-commit doc (module header — a load sees
@@ -2179,10 +2225,13 @@ fn load_echo_json(st: &mut SimState, slot0: u32) -> Vec<u8> {
         // saved array — the field-3 push is the LIVE document, which is what makes it the
         // confirm channel for the no-echo footswitch setters.
         let ftsw = st.ftsw_working.as_ref().or(doc.ftsw.as_ref());
-        return with_ftsw(&patched, ftsw).into_bytes();
+        return truncate_scene_push(st, with_ftsw(&patched, ftsw).into_bytes());
     }
     let _ = slot0;
-    with_ftsw(&st.preset_json, st.ftsw_working.as_ref()).into_bytes()
+    truncate_scene_push(
+        st,
+        with_ftsw(&st.preset_json, st.ftsw_working.as_ref()).into_bytes(),
+    )
 }
 
 /// The field-8 (`presetDataChanged`) read body for `slot0` — the slot's static scenario
@@ -2256,6 +2305,11 @@ fn structural_reply(st: &mut SimState, confirm_field: u32) -> Vec<Vec<u8>> {
 
 impl HidTransport for SimDevice {
     fn send(&self, _body: &[u8]) -> Result<(), String> {
+        self.state
+            .lock()
+            .expect("sim lock")
+            .events
+            .push(SimEvent::Heartbeat);
         Ok(()) // fire-and-forget (heartbeat) — no reply
     }
     fn transact(&self, body: &[u8], _pump_ms: u64) -> Result<Vec<Vec<u8>>, String> {
