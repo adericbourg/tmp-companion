@@ -92,7 +92,10 @@ it again. A `tauri build` only proves the bundler config parses — it cannot ca
 file that is present, correct and filed where nothing looks for it, which is
 precisely how the `256x256@2` mismatch above survived. The check asserts the binary,
 the udev rule, a desktop entry carrying `StartupWMClass`, and that every shipped
-icon sits in a hicolor directory matching its pixel size (with no strays).
+icon sits in a hicolor directory matching its pixel size (with no strays). It
+reads that size out of each PNG's IHDR rather than trusting the path — a file
+named and placed correctly but rendered at the wrong size is the same defect
+wearing a disguise, and a path-only check would pass it.
 
 The removal half is a gate too: `postrm.sh` reloads udev after the rule is gone, and
 a non-zero exit there would leave the package half-removed. Set `PAYLOAD_ROOT` to an

@@ -45,13 +45,35 @@ else
   fail=1
 fi
 
+# PNG IHDR: width is a big-endian u32 at byte 16, height at byte 20. Read with
+# od rather than a Python/ImageMagick dependency — the minimal Fedora image in
+# the rpm leg ships neither, and coreutils is already there.
+png_dim() { # <file> -> "WxH"
+  w=$(od -An -tu4 -j16 -N4 --endian=big "$1" 2>/dev/null | tr -d '[:space:]')
+  h=$(od -An -tu4 -j20 -N4 --endian=big "$1" 2>/dev/null | tr -d '[:space:]')
+  printf '%sx%s' "$w" "$h"
+}
+
 echo "hicolor icons"
-# Every size we ship must land in a directory hicolor actually defines, and the
-# file's pixel size must match what that directory declares. `256x256@2` means
-# "256 logical px at scale 2" = 512 PHYSICAL px — filing a 256px file there is
-# the bug this check exists to catch.
+# Every size we ship must land in a directory hicolor actually defines, AND the
+# file's real pixel size must match what that directory declares. Checking only
+# the path would miss the entire bug class: `256x256@2` means "256 logical px at
+# scale 2" = 512 PHYSICAL px, so a 256px file filed there is present, readable,
+# and wrong. Compare the IHDR against the directory name rather than trusting it.
 for size in 32x32 64x64 128x128 256x256; do
-  need "$ROOT/usr/share/icons/hicolor/$size/apps/tmp-companion.png" "$size icon"
+  icon="$ROOT/usr/share/icons/hicolor/$size/apps/tmp-companion.png"
+  if [ ! -e "$icon" ]; then
+    echo "  MISS  $size icon: $icon" >&2
+    fail=1
+    continue
+  fi
+  got=$(png_dim "$icon")
+  if [ "$got" = "$size" ]; then
+    echo "  ok    $size icon: $got px"
+  else
+    echo "  MISS  $size icon: directory says $size but the file is $got px" >&2
+    fail=1
+  fi
 done
 stray=$(find "$ROOT/usr/share/icons/hicolor" -path '*apps/tmp-companion.png' -printf '%h\n' \
         | sed 's|.*/hicolor/||; s|/apps||' | grep -v -E '^(32x32|64x64|128x128|256x256)$' || true)
