@@ -13,7 +13,8 @@ const h = vi.hoisted(() => {
   return {
     checkForUpdate: vi.fn<() => Promise<FoundUpdate | null>>(),
     relaunchApp: vi.fn<() => Promise<void>>(() => Promise.resolve()),
-    appInfo: vi.fn<() => Promise<{ name: string; version: string }>>(),
+    appInfo:
+      vi.fn<() => Promise<{ name: string; version: string; os: string }>>(),
     getStore: vi.fn<() => Promise<unknown>>(),
     setAutoInstallUpdates: vi.fn<(on: boolean) => Promise<void>>(() =>
       Promise.resolve(),
@@ -40,7 +41,11 @@ vi.mock("../lib/invoke", async (importOriginal) => {
 // Imported AFTER the mocks so the hook picks up the mocked seams.
 import { useUpdater, formatReleaseNotes } from "../lib/useUpdater";
 
-const info = (version: string): AppInfo => ({ name: "TMP Companion", version });
+const info = (version: string, os = "macos"): AppInfo => ({
+  name: "TMP Companion",
+  version,
+  os,
+});
 
 const storeWith = (auto: boolean): Store => ({
   profiles: [],

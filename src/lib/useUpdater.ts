@@ -26,6 +26,13 @@ export interface UpdaterApi {
   autoInstall: boolean;
   /** The running app's version (from `appInfo()`). */
   currentVersion: string | null;
+  /**
+   * Whether this build has an update channel to check at all. False on Linux:
+   * `scripts/latest-json.mjs` emits only `darwin-aarch64`/`darwin-x86_64`, so a
+   * Linux check can only ever come back empty — which the UI would otherwise
+   * present as "up to date" forever. Null until `appInfo()` resolves.
+   */
+  hasUpdateChannel: boolean | null;
   setAutoInstall: (on: boolean) => void;
   /** Manual check (the Settings button). Never throws. */
   check: () => Promise<"found" | "none" | "error">;
@@ -69,6 +76,9 @@ export function useUpdater(): UpdaterApi {
   const [percent, setPercent] = useState(0);
   const [autoInstall, setAutoInstallState] = useState(false);
   const [currentVersion, setCurrentVersion] = useState<string | null>(null);
+  const [hasUpdateChannel, setHasUpdateChannel] = useState<boolean | null>(
+    null,
+  );
 
   const start = useCallback((u: FoundUpdate) => {
     setPhase("downloading");
@@ -108,6 +118,9 @@ export function useUpdater(): UpdaterApi {
         const info = await appInfo();
         if (gone()) return;
         setCurrentVersion(info.version);
+        // Only macOS has keys in latest.json — see `hasUpdateChannel`.
+        const channel = info.os !== "linux";
+        setHasUpdateChannel(channel);
         let auto = false;
         try {
           const store = await getStore();
@@ -116,7 +129,7 @@ export function useUpdater(): UpdaterApi {
         } catch {
           // keep the default — the preference is cosmetic here
         }
-        if (gone() || info.version === DEV_VERSION) return;
+        if (gone() || info.version === DEV_VERSION || !channel) return;
         const found = await checkForUpdate();
         if (!gone() && found) onFound(found, auto);
       } catch {
@@ -170,6 +183,7 @@ export function useUpdater(): UpdaterApi {
     percent,
     autoInstall,
     currentVersion,
+    hasUpdateChannel,
     setAutoInstall,
     check,
     review,
