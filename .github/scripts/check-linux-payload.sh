@@ -47,11 +47,18 @@ fi
 
 # PNG IHDR: width is a big-endian u32 at byte 16, height at byte 20. Read with
 # od rather than a Python/ImageMagick dependency — the minimal Fedora image in
-# the rpm leg ships neither, and coreutils is already there.
+# the rpm leg ships neither, and od is in every base image.
+#
+# Bytes are read one at a time (`-tu1`) and recombined in awk rather than with
+# GNU's `-tu4 --endian=big`: that flag does not exist in the BSD od macOS ships,
+# and PAYLOAD_ROOT is meant to make this runnable on a maintainer's own machine.
+be32() { # <file> <byte offset> -> unsigned 32-bit big-endian value at that offset
+  od -An -tu1 -j"$2" -N4 "$1" 2>/dev/null |
+    awk '{ print $1 * 16777216 + $2 * 65536 + $3 * 256 + $4; exit }'
+}
+
 png_dim() { # <file> -> "WxH"
-  w=$(od -An -tu4 -j16 -N4 --endian=big "$1" 2>/dev/null | tr -d '[:space:]')
-  h=$(od -An -tu4 -j20 -N4 --endian=big "$1" 2>/dev/null | tr -d '[:space:]')
-  printf '%sx%s' "$w" "$h"
+  printf '%sx%s' "$(be32 "$1" 16)" "$(be32 "$1" 20)"
 }
 
 echo "hicolor icons"
@@ -75,12 +82,19 @@ for size in 32x32 64x64 128x128 256x256; do
     fail=1
   fi
 done
-stray=$(find "$ROOT/usr/share/icons/hicolor" -path '*apps/tmp-companion.png' -printf '%h\n' \
-        | sed 's|.*/hicolor/||; s|/apps||' | grep -v -E '^(32x32|64x64|128x128|256x256)$' || true)
-if [ -n "$stray" ]; then
-  echo "  MISS  icon filed in unexpected hicolor dir(s): $stray" >&2
-  fail=1
-fi
+# Glob rather than `find -printf`: that is GNU-only too, and this sweep is the
+# half that catches an icon filed somewhere nothing looks (the `256x256@2` case).
+for icon in "$ROOT"/usr/share/icons/hicolor/*/apps/tmp-companion.png; do
+  [ -e "$icon" ] || continue
+  dir=$(basename "$(dirname "$(dirname "$icon")")")
+  case "$dir" in
+    32x32 | 64x64 | 128x128 | 256x256) ;;
+    *)
+      echo "  MISS  icon filed in unexpected hicolor dir: $dir" >&2
+      fail=1
+      ;;
+  esac
+done
 
 if [ "$fail" -ne 0 ]; then
   echo "payload check FAILED" >&2
