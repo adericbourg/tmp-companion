@@ -16,6 +16,8 @@
 export interface AppInfo {
   name: string;
   version: string;
+  /** Compile-time target OS ("macos", "linux", …) — see `hasUpdateChannel`. */
+  os: string;
 }
 
 /** Result of `save_support_bundle` (mirrors commands::support::SupportBundleResult). */
