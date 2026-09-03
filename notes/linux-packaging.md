@@ -62,6 +62,47 @@ not extend them** — `bundle.targets` here (`["deb", "rpm"]`) fully supersedes 
 build jobs carry no `TAURI_SIGNING_PRIVATE_KEY`, and a `true` here fails the build outright
 for no benefit — see the next section.
 
+## The Linux icon list is its own `bundle.icon`
+
+`tauri.linux.conf.json` overrides `bundle.icon` rather than inheriting the base
+list, because the bundler files each PNG into `/usr/share/icons/hicolor/<dir>/apps/`
+using a directory derived from the FILE NAME, and the base list is named for macOS.
+
+`icons/128x128@2x.png` is a 256×256 file, and the `@2x` made the bundler file it
+under `256x256@2` — which hicolor defines as `Size=256, Scale=2`, i.e. a slot that
+expects **512×512 physical pixels**. A 256×256 file there is a size/scale mismatch,
+so every HiDPI 256pt lookup got half the pixels it asked for. There was also no
+plain `256x256` and no `64x64` at all (`icons/64x64.png` exists on disk and was
+simply never listed), leaving `128x128` as the largest usable icon.
+
+The Linux list is therefore spelled with plainly-named files only —
+`32x32 / 64x64 / 128x128 / 256x256` — each landing in a directory that matches its
+own pixel size. `icons/256x256.png` is the same art as `128x128@2x.png`, named for
+hicolor rather than for macOS. Note `1024x1024` is NOT a hicolor directory, so
+`icons/icon.png` must stay out of this list even though it is the largest asset.
+
+Remember merge-patch REPLACES arrays: this list fully supersedes the base's, which
+is exactly what keeps `icon.icns`/`icon.ico` out of the Linux bundle.
+
+## The `.deb`/`.rpm` are install-tested, not just build-tested
+
+`ci.yml`'s `bundle-linux` installs each package it builds, runs
+`.github/scripts/check-linux-payload.sh` against the installed tree, then removes
+it again. A `tauri build` only proves the bundler config parses — it cannot catch a
+file that is present, correct and filed where nothing looks for it, which is
+precisely how the `256x256@2` mismatch above survived. The check asserts the binary,
+the udev rule, a desktop entry carrying `StartupWMClass`, and that every shipped
+icon sits in a hicolor directory matching its pixel size (with no strays). It
+reads that size out of each PNG's IHDR rather than trusting the path — a file
+named and placed correctly but rendered at the wrong size is the same defect
+wearing a disguise, and a path-only check would pass it.
+
+The removal half is a gate too: `postrm.sh` reloads udev AND re-triggers hidraw after the rule is
+gone — a reload alone updates only future events, so a unit still plugged in at uninstall would keep
+the `uaccess` ACL the departed rule gave it (the mirror of why `postinst.sh` triggers), and
+a non-zero exit there would leave the package half-removed. Set `PAYLOAD_ROOT` to an
+unpacked package tree to run the check locally without installing anything.
+
 ## No Linux updater channel (yet)
 
 `scripts/latest-json.mjs` emits only `darwin-aarch64`/`darwin-x86_64` keys. A Linux

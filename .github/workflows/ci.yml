@@ -188,9 +188,11 @@ jobs:
       - name: Install Fedora build dependencies
         if: matrix.target == 'rpm'
         run: |
+          # findutils: the payload check greps the installed tree with
+          # `find -printf`, and the minimal Fedora image does not ship it.
           dnf install -y git nodejs gcc gcc-c++ make pkgconf-pkg-config \
             webkit2gtk4.1-devel openssl-devel librsvg2-devel libxdo-devel \
-            libappindicator-gtk3-devel alsa-lib-devel
+            libappindicator-gtk3-devel alsa-lib-devel findutils
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -221,6 +223,42 @@ jobs:
 
       - name: Build the .${{ matrix.target }} bundle
         run: bun run tauri build --bundles ${{ matrix.target }}
+
+      # Building the package proves the bundler config parses; it proves nothing
+      # about what the package DOES. Installing it is what exercises the udev
+      # rule's path, the postinst/postrm hooks and the `depends` names — and it
+      # is the only thing that catches a wrong hicolor icon DIRECTORY, which is
+      # invisible to a build: the file is present and correct, just filed where
+      # no icon theme will look for it.
+      - name: Install the .deb, check its payload, remove it
+        if: matrix.target == 'deb'
+        run: |
+          set -euo pipefail
+          deb=$(readlink -f "$(find src-tauri/target/release/bundle/deb -name '*.deb' | head -1)")
+          name=$(dpkg-deb -f "$deb" Package)
+          echo "installing $name from $deb"
+          # `apt-get install ./file.deb` resolves `depends` (sqlite3, libasound2)
+          # rather than leaving the package half-configured the way `dpkg -i` does.
+          sudo apt-get install -y "$deb"
+          bash .github/scripts/check-linux-payload.sh
+          # Removal must be clean too: postrm reloads udev, and a non-zero exit
+          # there would leave the package half-removed.
+          sudo apt-get remove -y "$name"
+          test ! -e /usr/lib/udev/rules.d/70-fender-tone-master-pro.rules
+          echo "removed cleanly; udev rule gone"
+
+      - name: Install the .rpm, check its payload, remove it
+        if: matrix.target == 'rpm'
+        run: |
+          set -euo pipefail
+          rpm=$(readlink -f "$(find src-tauri/target/release/bundle/rpm -name '*.rpm' | head -1)")
+          name=$(rpm -qp --qf '%{NAME}' "$rpm")
+          echo "installing $name from $rpm"
+          dnf install -y "$rpm"
+          bash .github/scripts/check-linux-payload.sh
+          dnf remove -y "$name"
+          test ! -e /usr/lib/udev/rules.d/70-fender-tone-master-pro.rules
+          echo "removed cleanly; udev rule gone"
 
   commitlint:
     if: github.event_name == 'pull_request'
