@@ -18,13 +18,13 @@ Linux install of this app needs done automatically:
   `packaging/udev/70-fender-tone-master-pro.rules` landing in
   `/usr/lib/udev/rules.d/` and udev reloading, the app finds no device at all
   (`EACCES` — see `hid.rs`'s `open_device()`).
-- **Guarantee `sqlite3` on `PATH`.** `backup_read.rs` shells out to the `sqlite3` CLI for
-  the whole library-scan/block-discovery/scene-handle path — an out-of-Cargo runtime
-  dependency an AppImage cannot bundle a guarantee for.
+- **Run install and removal hooks.** They reload udev and re-trigger connected HID devices
+  when the access rule is added or removed. Backup reads now use bundled SQLite through
+  `rusqlite`; that path no longer requires command-line SQLite.
 
-A real package solves both as metadata: `bundle.linux.deb/rpm.files` ships the rule,
-`postInstallScript` (`packaging/linux/postinst.sh`) reloads udev, and `depends` pulls in
-`sqlite3`/`libasound2` (deb) or `sqlite`/`alsa-lib` (rpm). Arch, NixOS, and other
+A real package declares these files, hooks and runtime libraries in its metadata:
+`bundle.linux.deb/rpm.files` ships the rule, `postInstallScript` reloads udev, and
+`postRemoveScript` updates device access after removal. Arch, NixOS, and other
 non-deb/rpm distros are expected to build from source (`CONTRIBUTING.md`).
 
 ## The udev rule and postinst
@@ -108,59 +108,55 @@ unpacked package tree to run the check locally without installing anything.
 `scripts/latest-json.mjs` emits only `darwin-aarch64`/`darwin-x86_64` keys. A Linux
 install's in-app update check finds nothing at that endpoint and stays silent
 (`useUpdater.ts` treats any check failure as silent-fail by design) — Linux users update by
-re-downloading the latest `.deb`/`.rpm`. Not worth standing up and signing a second
+installing updates through apt/dnf or re-downloading the latest `.deb`/`.rpm`. Not worth standing up and signing a second
 updater channel for an alpha; revisit once Linux has left alpha.
 
 ## Apt + dnf/yum repositories
 
-Every release that produces a `.deb`/`.rpm` also publishes it into a real,
-standards-compliant package repository hosted on this same GitHub Pages site —
-`https://pcavadas.github.io/tmp-companion/apt` (reprepro, pool/dists layout) and
-`https://pcavadas.github.io/tmp-companion/rpm` (createrepo_c, repodata layout).
-Both are rebuilt fresh every release run, not incrementally maintained —
-`docs/apt/db/` (reprepro's working Berkeley DB) is gitignored and rebuilt from
-scratch each run; `docs/rpm/repodata/` has no separate working state since
-`createrepo_c` is stateless.
+A release with Linux artifacts publishes signed package repositories at
+`https://pcavadas.github.io/tmp-companion/apt` and
+`https://pcavadas.github.io/tmp-companion/rpm`. Package files and generated metadata
+are committed to `codex/linux-package-repos`, under `apt/` and `rpm/`.
+They are not committed to protected `main` or mixed into the website's source.
 
-**Signing.** One dedicated RSA-4096 sign-only GPG key (distinct from the Tauri
-updater minisign key and the Apple signing certs), private key held as the
-`APT_GPG_PRIVATE_KEY` secret scoped to the `release` GitHub Environment — same
-trust boundary as the Apple secrets. Passphrase-less: the key material is
-already protected as a scoped Actions secret, and a passphrase only adds CI
-complexity (loopback pinentry) for no additional real security. RSA over
-Ed25519 specifically because the rpm side only needs broad client
-compatibility, not signature size/speed — RSA has zero known verification gaps
-across every apt or dnf/yum client that has shipped; Ed25519 support in older
-enterprise dnf/GPGME stacks is not universally reliable. The public key is
-re-exported from the imported private key on every CI run — `docs/apt/pubkey.gpg`
-(dearmored, for apt's `Signed-By=`) and `docs/rpm/RPM-GPG-KEY-tmp-companion`
-(armored, the dnf/yum convention) — so it's always in sync automatically,
-never hand-maintained.
+**Publication.** The `publish-linux-repos` job in `release.yml` downloads whatever
+Linux builds succeeded. No artifacts means no key import, signing, Git checkout or
+push. If only one format is available, its repository is replaced and the other
+format's published files remain unchanged. Both replacement builds are verified
+before the generated checkout is updated and pushed as one commit.
 
-**Apt repo signs are Release-level, not per-package** — that's `reprepro`'s
-normal signing model. **The rpm repo signs `repodata/repomd.xml` only**, not
-each individual `.rpm` (`rpm --addsign` is deliberately skipped — see the CI
-job comments). `primary.xml.gz` records each rpm's SHA-256, and `repomd.xml`
-records a checksum of `primary.xml.gz`, so signing `repomd.xml` transitively
-covers every listed package — the same trust chain apt's own
-Release→Packages.gz→.deb chain gives. The `.repo` file therefore ships
-`gpgcheck=0`, `repo_gpgcheck=1` — `gpgcheck=1` with no embedded per-package
-signature would make every `dnf install` fail outright.
+`scripts/build-linux-repos.sh` renders `packaging/apt/conf/distributions` into a
+temporary configuration directory and substitutes the imported key's full fingerprint
+automatically. The tracked placeholder stays unchanged. The APT database and complete
+pool/dists output are built from scratch outside the checkout; an absent database
+cannot leave old package blobs behind. RPM metadata and packages are also rebuilt
+in a fresh directory. Each replaced format serves only the current successful build.
+Older package blobs remain in Git history and older release assets remain available.
 
-**Pruning: only the latest version is kept in the working tree.** Each publish
-run does `reprepro remove stable <pkg>` before `includedeb`, and rewrites
-`docs/rpm/*.rpm` outright before `createrepo_c`. This keeps the _served_ repo
-small; it does **not** shrink git history — old pool/rpm blobs remain in past
-commits, an accepted tradeoff of a git-backed static host. Given the project's
-alpha posture and the existing "users re-download the latest `.deb`/`.rpm`"
-update model (see "No Linux updater channel" above), keeping only the latest
-version is the right default: there is no in-place upgrade story that depends
-on an old version staying installable from this repo, and a growing served
-pool with no expiry policy is a worse failure mode (unbounded Pages storage)
-than "reinstall a needed old version from a GitHub Release asset instead" —
-Assets already keep every past release's artifact indefinitely.
+**Signing.** A dedicated RSA-4096 signing key, separate from the Tauri updater key,
+is stored as `APT_GPG_PRIVATE_KEY` in the `release` environment. The environment allows
+only `main`, and release/publication jobs also have explicit main-only guards.
+The passphrase-free key is imported into a temporary private GnuPG home that is removed
+when the job finishes. Its public keys are exported with the repository:
+`apt/pubkey.gpg` is binary for apt's `Signed-By`; `rpm/RPM-GPG-KEY-tmp-companion` is
+armored for dnf/yum.
 
-**Install (end users).**
+APT signs Release and InRelease metadata. RPM signs `repodata/repomd.xml`, whose
+checksums cover the package indexes and packages. Individual RPM packages are not
+signed, so the configuration keeps `gpgcheck=0` and `repo_gpgcheck=1`.
+RSA targets broad client compatibility; native Ubuntu apt and Fedora dnf validation
+are the tested client boundaries.
+
+**Pages deployment.** `.github/workflows/pages.yml` checks out the current `main`
+website, overlays the generated branch's repositories with `scripts/compose-pages.sh`,
+and deploys one Pages artifact. Website changes trigger it directly. After package
+publication, the release workflow calls it explicitly: a `GITHUB_TOKEN` push does not
+trigger another Actions workflow. A missing generated branch permits website-only
+deployment. GitHub Pages must use the **GitHub Actions** deployment source.
+The website stays under its existing `/tmp-companion/` project path and retains
+relative asset links.
+
+**Install and upgrade.**
 
 ```bash
 # apt (Debian/Ubuntu)
@@ -169,44 +165,22 @@ curl -fsSL https://pcavadas.github.io/tmp-companion/apt/pubkey.gpg \
 echo "deb [signed-by=/usr/share/keyrings/tmp-companion.gpg] https://pcavadas.github.io/tmp-companion/apt stable main" \
   | sudo tee /etc/apt/sources.list.d/tmp-companion.list
 sudo apt update && sudo apt install tmp-companion
+# Later: sudo apt update && sudo apt install --only-upgrade tmp-companion
 
 # dnf/yum (Fedora/RHEL-family)
 sudo curl -fsSL -o /etc/yum.repos.d/tmp-companion.repo \
   https://pcavadas.github.io/tmp-companion/rpm/tmp-companion.repo
 sudo dnf install tmp-companion
+# Later: sudo dnf upgrade tmp-companion
 ```
 
-**CI job.** `publish-linux-repos` in `release.yml`, gated on
-`needs.release.result == 'success'` only — never on `build-deb`/`build-rpm`'s
-`result`, which `continue-on-error: true` forces to report `success` even when
-the underlying build genuinely failed. Whether there's anything to publish is
-determined at runtime from artifact presence (`hashFiles(...)`), the same
-tolerant pattern the `release` job already uses for its own Linux-asset
-download. Combined into one job rather than split `publish-apt`/`publish-rpm`
-so there is exactly one checkout → commit → push to `main` per run — two
-independent jobs each pushing in the same run would race each other's
-fast-forward.
-
-`packaging/apt/conf/distributions` ships with a `SignWith: PLACEHOLDER_FPR`
-placeholder rather than a real fingerprint — the CI job `sed`s the imported
-key's actual fingerprint into its own checkout right after importing
-`APT_GPG_PRIVATE_KEY`, so the repo config never needs a manual, easy-to-forget
-edit and stays correct even if the signing key is ever rotated.
-
-**Known gap — the `release` GitHub Environment has no deployment-branch
-restriction.** `workflow_dispatch` (the manual fallback for an auto-merged
-push that `GITHUB_TOKEN` silently skips — see the workflow's top-of-file
-comment) can run against any branch a collaborator selects in the Actions UI,
-and `environment: release` carries no branch policy (`protection_rules` is
-empty via the API) — so a non-`main` dispatch could reach every `release`-
-scoped secret, Apple certs and `TAURI_SIGNING_PRIVATE_KEY` included, a gap
-that predates this feature. `publish-linux-repos` adds its own
-`github.ref == 'refs/heads/main'` guard as defense-in-depth for the new
-`APT_GPG_PRIVATE_KEY` exposure, but that only protects this one job — the
-real fix is a GitHub Environment deployment-branch rule (Settings →
-Environments → `release` → restrict to `main`), which is a repo-settings
-change outside what a workflow file can express, and is a pre-existing gap
-on the `release` job itself, not something introduced here.
+**Validation.** CI builds two versions of each real Tauri package. The
+`.github/scripts/test-linux-repos.py` gate uses temporary RSA signing keys and
+local repositories to check signatures, native apt/dnf installation and upgrades,
+payloads, tamper rejection, repeated publication, pruning without an APT database,
+missing-format preservation, no-artifact behavior, failed replacement builds,
+the unchanged signing template, and Pages composition. Its Git tests push only to a
+temporary local bare repository and verify that package publication never changes `main`.
 
 ## Release pipeline shape
 
@@ -220,7 +194,10 @@ resolve-version (ubuntu)              semantic-release --dry-run → next versio
         release (macos-14)            downloads both bundles, runs the real semantic-release
               │
               ▼
-        publish-linux-repos (ubuntu)  publishes docs/apt + docs/rpm to GitHub Pages
+        publish-linux-repos (ubuntu)  commits apt/ + rpm/ to codex/linux-package-repos
+              │
+              ▼
+        deploy-linux-repos           calls pages.yml to compose and deploy the site
 ```
 
 `resolve-version` needs `permissions: contents: write` despite writing nothing:

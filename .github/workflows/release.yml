@@ -219,7 +219,7 @@ jobs:
     # skipped (nothing releasable) — this job's own behavior is unchanged from
     # before the Linux jobs existed either way. Only a cancelled run, or a genuine
     # resolve-version failure (as opposed to "nothing to release"), skips it.
-    if: ${{ !cancelled() && needs.resolve-version.result == 'success' }}
+    if: ${{ !cancelled() && needs.resolve-version.result == 'success' && github.ref == 'refs/heads/main' }}
     runs-on: macos-14 # macOS-only crate; ARM host cross-builds the universal (arm64+x86_64) binary
     environment: release # gates the Apple signing/notarization secrets to this env
     permissions:
@@ -295,52 +295,19 @@ jobs:
 
   publish-linux-repos:
     needs: [resolve-version, build-deb, build-rpm, release]
-    # Mirrors `release`'s own override of the default `if: success()`: a skipped
-    # build-deb/build-rpm (nothing releasable) must not skip this job — it must
-    # still run (and then no-op if there's nothing to publish). Never reference
-    # build-deb/build-rpm's result: both are `continue-on-error: true`, which
-    # forces GitHub Actions to report `success` even when steps genuinely failed.
-    # Whether there's anything to publish is determined at runtime from artifact
-    # presence, exactly mirroring how `release` itself tolerates missing Linux assets.
-    #
-    # `github.ref == 'refs/heads/main'` is deliberate, separate from the
-    # resolve-version gate above: `workflow_dispatch` can run this workflow
-    # against ANY branch a collaborator selects in the Actions UI, and the
-    # `release` GitHub Environment has no deployment-branch restriction
-    # configured (checked via the API — protection_rules is empty), so nothing
-    # else stops a non-main dispatch from reaching APT_GPG_PRIVATE_KEY and this
-    # job's contents: write. This is this job's own guard, not a fix for that
-    # gap — see notes/linux-packaging.md for the full picture and the
-    # pre-existing exposure on the `release` job itself.
+    # Artifact presence, not continue-on-error build results, determines publication.
     if: ${{ !cancelled() && needs.release.result == 'success' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
-    environment: release # APT_GPG_PRIVATE_KEY is scoped to this environment
+    environment: release
     permissions:
       contents: write
+    outputs:
+      changed: ${{ steps.publish.outputs.changed }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          persist-credentials: true
-
-      - name: Install repo-building tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y reprepro createrepo-c gnupg
-
-      - name: Import signing key
-        env:
-          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
-        run: |
-          set -euo pipefail
-          echo "$APT_GPG_PRIVATE_KEY" | gpg --batch --import
-          FPR="$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr:/{print $10; exit}')"
-          echo "FPR=$FPR" >>"$GITHUB_ENV"
-          # packaging/apt/conf/distributions ships a placeholder SignWith — the
-          # real fingerprint is only known once the secret is imported above.
-          # Substituted here in the runner's checkout only; never committed
-          # back (the "Commit and push" step only stages docs/apt + docs/rpm).
-          sed -i "s/PLACEHOLDER_FPR/$FPR/" packaging/apt/conf/distributions
+          persist-credentials: false
 
       - name: Download .deb artifact (if any)
         continue-on-error: true
@@ -356,54 +323,60 @@ jobs:
           name: linux-rpm
           path: incoming-rpm
 
-      - name: Publish apt repo (if a .deb was built this run)
-        if: hashFiles('incoming-deb/*.deb') != ''
+      - name: Detect package artifacts before importing a key
+        id: artifacts
+        shell: bash
         run: |
-          set -euo pipefail
-          DEB="$(ls incoming-deb/*.deb | head -1)"
-          # tmp-companion: VERIFY against the real .deb during implementation —
-          # `dpkg-deb -f "$DEB" Package` — and substitute here if it differs.
-          reprepro --confdir packaging/apt/conf --dbdir docs/apt/db --outdir docs/apt \
-            remove stable tmp-companion || true
-          reprepro --confdir packaging/apt/conf --dbdir docs/apt/db --outdir docs/apt \
-            includedeb stable "$DEB"
-          # Verify the Release file was signed by checking its signature
-          gpg --batch --verify docs/apt/dists/stable/Release.gpg docs/apt/dists/stable/Release
-          gpg --batch --yes --export --armor "$FPR" | gpg --dearmor >docs/apt/pubkey.gpg
+          found=false
+          for package in incoming-deb/*.deb incoming-rpm/*.rpm; do
+            if [ -f "$package" ]; then found=true; break; fi
+          done
+          echo "found=$found" >> "$GITHUB_OUTPUT"
 
-      - name: Publish rpm repo (if an .rpm was built this run)
-        if: hashFiles('incoming-rpm/*.rpm') != ''
+      - name: Install repo-building tools
+        if: steps.artifacts.outputs.found == 'true'
         run: |
-          set -euo pipefail
-          mkdir -p docs/rpm
-          rm -f docs/rpm/*.rpm
-          cp incoming-rpm/*.rpm docs/rpm/
-          createrepo_c docs/rpm
-          gpg --batch --yes --local-user "$FPR" --detach-sign --armor \
-            -o docs/rpm/repodata/repomd.xml.asc docs/rpm/repodata/repomd.xml
-          # Verify the signature was created and can be verified
-          gpg --batch --verify docs/rpm/repodata/repomd.xml.asc docs/rpm/repodata/repomd.xml
-          gpg --batch --yes --export --armor "$FPR" >docs/rpm/RPM-GPG-KEY-tmp-companion
-          printf '%s\n' \
-            '[tmp-companion]' \
-            'name=TMP Companion' \
-            'baseurl=https://pcavadas.github.io/tmp-companion/rpm' \
-            'enabled=1' \
-            'gpgcheck=0' \
-            'repo_gpgcheck=1' \
-            'gpgkey=https://pcavadas.github.io/tmp-companion/rpm/RPM-GPG-KEY-tmp-companion' \
-            >docs/rpm/tmp-companion.repo
+          sudo apt-get update
+          sudo apt-get install -y reprepro createrepo-c gnupg rpm
 
-      - name: Commit and push
+      - name: Import the dedicated signing key
+        if: steps.artifacts.outputs.found == 'true'
+        env:
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
         run: |
           set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add docs/apt docs/rpm
-          if git diff --cached --quiet; then
-            echo "publish-linux-repos: no repo changes this run — nothing to commit"
-            exit 0
+          GNUPGHOME="$(mktemp -d "$RUNNER_TEMP/linux-repo-key.XXXXXX")"
+          chmod 700 "$GNUPGHOME"
+          export GNUPGHOME
+          echo "GNUPGHOME=$GNUPGHOME" >> "$GITHUB_ENV"
+          printf '%s\n' "$APT_GPG_PRIVATE_KEY" | gpg --batch --import
+          keys="$(gpg --batch --list-secret-keys --with-colons)"
+          test "$(printf '%s\n' "$keys" | awk -F: '$1 == "sec" { n++ } END { print n+0 }')" -eq 1
+          FPR="$(printf '%s\n' "$keys" | awk -F: '$1 == "fpr" { print $10; exit }')"
+          echo "FPR=$FPR" >> "$GITHUB_ENV"
+
+      - name: Publish to the generated repository branch
+        if: steps.artifacts.outputs.found == 'true'
+        id: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.resolve-version.outputs.version }}
+        run: bash scripts/publish-linux-repos.sh incoming-deb incoming-rpm "$FPR" "$VERSION"
+
+      - name: Remove the temporary signing key
+        if: always()
+        run: |
+          if [ -n "${GNUPGHOME:-}" ]; then
+            gpgconf --homedir "$GNUPGHOME" --kill gpg-agent
+            rm -rf "$GNUPGHOME"
           fi
-          git commit -m "chore(release): publish Linux apt/rpm repo for ${{ needs.resolve-version.outputs.version }}"
-          git pull --rebase origin main
-          git push origin HEAD:main
+
+  deploy-linux-repos:
+    needs: publish-linux-repos
+    # GITHUB_TOKEN pushes do not trigger another workflow. Deploy explicitly.
+    if: ${{ !cancelled() && needs.publish-linux-repos.outputs.changed == 'true' && github.ref == 'refs/heads/main' }}
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    uses: ./.github/workflows/pages.yml
