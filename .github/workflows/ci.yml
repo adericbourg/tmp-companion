@@ -285,13 +285,16 @@ jobs:
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: linux-validation-${{ matrix.target }}
+          name: linux-${{ matrix.target }}
           path: repo-test-artifacts
           retention-days: 1
           if-no-files-found: error
 
   validate-linux-repos:
     needs: bundle-linux
+    permissions:
+      contents: read
+      actions: read
     strategy:
       fail-fast: false
       matrix:
@@ -308,7 +311,7 @@ jobs:
     steps:
       - name: Install Fedora publication tools
         if: matrix.format == 'rpm'
-        run: dnf install -y git gnupg2 createrepo_c python3 findutils
+        run: dnf install -y git gh gnupg2 createrepo_c python3 findutils
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -320,9 +323,17 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y reprepro createrepo-c gnupg rpm
 
+      - name: Verify artifact discovery against this workflow run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bash .github/scripts/select-linux-artifacts.sh > discovered-artifacts
+          grep -qx 'deb=true' discovered-artifacts
+          grep -qx 'rpm=true' discovered-artifacts
+
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          pattern: linux-validation-*
+          pattern: linux-*
           path: repo-artifacts
 
       - name: Test publication, signatures and native package upgrades

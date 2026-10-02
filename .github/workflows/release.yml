@@ -302,6 +302,7 @@ jobs:
     environment: release
     permissions:
       contents: write
+      actions: read # artifact inventory through the REST API
     outputs:
       changed: ${{ steps.publish.outputs.changed }}
     timeout-minutes: 15

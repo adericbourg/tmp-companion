@@ -267,9 +267,9 @@ def main():
             keys = output("gpg", "--batch", "--list-secret-keys", "--with-colons", env=env)
             fpr = next(line.split(":")[9] for line in keys.splitlines() if line.startswith("fpr:"))
             if fmt == "apt":
-                regressions(work, artifacts / "linux-validation-deb",
-                            artifacts / "linux-validation-rpm", fpr, env)
-            native_client(work, fmt, artifacts / ("linux-validation-deb" if fmt == "apt" else "linux-validation-rpm"),
+                regressions(work, artifacts / "linux-deb",
+                            artifacts / "linux-rpm", fpr, env)
+            native_client(work, fmt, artifacts / ("linux-deb" if fmt == "apt" else "linux-rpm"),
                           fpr, env)
         finally:
             run("gpgconf", "--homedir", gnupg, "--kill", "gpg-agent", check=False)
