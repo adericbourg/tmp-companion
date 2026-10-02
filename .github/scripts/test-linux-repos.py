@@ -22,8 +22,11 @@ def run(*args, env=None, check=True, capture=False):
 def output(*args, env=None):
     return run(*args, env=env, capture=True).stdout.strip()
 
+def file_digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
 def digest(directory):
-    return {str(p.relative_to(directory)): hashlib.sha256(p.read_bytes()).hexdigest()
+    return {str(p.relative_to(directory)): file_digest(p)
             for p in sorted(directory.rglob("*")) if p.is_file()}
 
 def package(directory, suffix):
@@ -43,7 +46,33 @@ def signatures(dest, env):
         run("gpg", "--batch", "--verify", dest / "rpm/repodata/repomd.xml.asc",
             dest / "rpm/repodata/repomd.xml", env=env)
 
+def artifact_selection(work, env):
+    mock = work / "mock-gh"
+    mock.mkdir()
+    gh = mock / "gh"
+    gh.write_text("""#!/bin/sh
+printf '%s' "$MOCK_ARTIFACTS"
+exit "${MOCK_EXIT:-0}"
+""")
+    gh.chmod(0o755)
+    base = dict(env, PATH=str(mock) + os.pathsep + env["PATH"],
+                GITHUB_REPOSITORY="fixture/repo", GITHUB_RUN_ID="123")
+    script = ROOT / ".github/scripts/select-linux-artifacts.sh"
+    cases = [("", "deb=false\nrpm=false"),
+             ("linux-deb\tfalse\n", "deb=true\nrpm=false"),
+             ("linux-rpm\tfalse\n", "deb=false\nrpm=true"),
+             ("linux-deb\tfalse\nlinux-rpm\tfalse\n", "deb=true\nrpm=true")]
+    for inventory, expected in cases:
+        assert output("bash", script, env=dict(base, MOCK_ARTIFACTS=inventory)) == expected
+    for inventory, code in [("", "42"), ("linux-deb\ttrue\n", "0"),
+                            ("linux-rpm\tinvalid\n", "0")]:
+        result = run("bash", script, env=dict(base, MOCK_ARTIFACTS=inventory,
+                     MOCK_EXIT=code), check=False, capture=True)
+        assert result.returncode != 0 and not result.stdout
+    print("PASS: artifact inventory both/one/none, API failure and expired artifacts", flush=True)
+
 def regressions(work, deb, rpm, fpr, env):
+    artifact_selection(work, env)
     missing, dest = work / "absent", work / "combined"
     template = (ROOT / "packaging/apt/conf/distributions").read_bytes()
     build(deb / "v1", rpm / "v1", dest, fpr, env)
@@ -53,8 +82,10 @@ def regressions(work, deb, rpm, fpr, env):
     assert not (dest / "apt/db").exists()
     build(deb / "v2", missing, dest, fpr, env)
     assert digest(dest / "rpm") == old_rpm
-    assert list((dest / "apt").rglob("*.deb"))[0].name == package(deb / "v2", "deb").name
-    assert len(list((dest / "apt").rglob("*.deb"))) == 1
+    published_debs = list((dest / "apt").rglob("*.deb"))
+    assert len(published_debs) == 1
+    # reprepro normalizes filenames from control metadata; verify the actual bytes.
+    assert file_digest(published_debs[0]) == file_digest(package(deb / "v2", "deb"))
     old_apt = digest(dest / "apt")
     build(missing, rpm / "v2", dest, fpr, env)
     assert digest(dest / "apt") == old_apt
@@ -126,8 +157,11 @@ def regressions(work, deb, rpm, fpr, env):
     assert (site / "index.html").read_text() == "current website\n"
     assert (site / ".nojekyll").exists()
     assert not (site / ".git").exists()
-    assert len(list((site / "apt").rglob("*.deb"))) == 1
-    assert len(list((site / "rpm").glob("*.rpm"))) == 1
+    site_debs = list((site / "apt").rglob("*.deb"))
+    site_rpms = list((site / "rpm").glob("*.rpm"))
+    assert len(site_debs) == len(site_rpms) == 1
+    assert file_digest(site_debs[0]) == file_digest(package(deb / "v2", "deb"))
+    assert file_digest(site_rpms[0]) == file_digest(package(rpm / "v2", "rpm"))
     signatures(site, env)
     print("PASS: both/one/no artifacts, pruning without DB, repeat builds, failure preservation, clean template, generated branch and Pages composition", flush=True)
 
