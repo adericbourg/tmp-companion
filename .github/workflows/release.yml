@@ -44,6 +44,7 @@ jobs:
   # publish plugin, so the elevated token is only ever spent on that dry-run push
   # probe and the GitHub plugin's read-only permission check.
   resolve-version:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -367,7 +368,7 @@ jobs:
         if: always()
         run: |
           if [ -n "${GNUPGHOME:-}" ]; then
-            gpgconf --homedir "$GNUPGHOME" --kill gpg-agent
+            gpgconf --homedir "$GNUPGHOME" --kill gpg-agent || true
             rm -rf "$GNUPGHOME"
           fi
 

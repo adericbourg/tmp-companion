@@ -127,7 +127,8 @@ before the generated checkout is updated and pushed as one commit.
 
 `scripts/build-linux-repos.sh` renders `packaging/apt/conf/distributions` into a
 temporary configuration directory and substitutes the imported key's full fingerprint
-automatically. The tracked placeholder stays unchanged. The APT database and complete
+automatically. The tracked placeholder stays unchanged. Publication supplies the
+`sound` section, which the Tauri Debian bundle omits, and its `optional` priority. The APT database and complete
 pool/dists output are built from scratch outside the checkout; an absent database
 cannot leave old package blobs behind. RPM metadata and packages are also rebuilt
 in a fresh directory. Each replaced format serves only the current successful build.

@@ -23,7 +23,8 @@ if [ "$have_deb" -eq 1 ]; then
   sed "s/PLACEHOLDER_FPR/$FPR/" "$REPO/packaging/apt/conf/distributions" > "$work/apt-conf/distributions"
   for package in "$DEB_DIR"/*.deb; do
     [ -f "$package" ] || continue
-    reprepro --confdir "$work/apt-conf" --dbdir "$work/apt-db" --outdir "$work/apt" includedeb stable "$package"
+    # Tauri bundles omit Section; supply it and preserve their optional priority.
+    reprepro --section sound --priority optional --confdir "$work/apt-conf" --dbdir "$work/apt-db" --outdir "$work/apt" includedeb stable "$package"
   done
   gpg --batch --verify "$work/apt/dists/stable/Release.gpg" "$work/apt/dists/stable/Release"
   gpg --batch --verify "$work/apt/dists/stable/InRelease"
