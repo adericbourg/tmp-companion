@@ -130,14 +130,16 @@ def regressions(work, deb, rpm, fpr, env):
     run("git", "-C", seed, "remote", "add", "origin", remote)
     run("git", "-C", seed, "push", "--quiet", "origin", "main")
     main_before = output("git", "--git-dir", remote, "rev-parse", "main")
+    remote_uri = remote.as_uri()  # file:// makes Git honor shallow clone depth.
     empty_site = work / "empty-site"
-    run("bash", COMPOSE, seed / "docs", remote, empty_site, env=env)
+    run("bash", COMPOSE, seed / "docs", remote_uri, empty_site, env=env)
     assert (empty_site / "index.html").read_text() == "current website\n"
     assert (empty_site / ".nojekyll").exists()
 
     branch = "codex/linux-package-repos"
-    pub_env = dict(env, LINUX_REPO_REMOTE=str(remote))
+    pub_env = dict(env, LINUX_REPO_REMOTE=remote_uri)
     run("bash", PUBLISH, deb / "v1", missing, fpr, "0.0.1", env=pub_env)
+    first_publication = output("git", "--git-dir", remote, "rev-parse", branch)
     apt_tree = output("git", "--git-dir", remote, "rev-parse", branch + ":apt")
     run("bash", PUBLISH, missing, rpm / "v1", fpr, "0.0.1", env=pub_env)
     assert output("git", "--git-dir", remote, "rev-parse", branch + ":apt") == apt_tree
@@ -150,10 +152,11 @@ def regressions(work, deb, rpm, fpr, env):
     run("bash", PUBLISH, deb / "v2", rpm / "v2", fpr, "0.0.2-repeat", env=pub_env)
     assert output("git", "--git-dir", remote, "rev-parse", "main") == main_before
     generated = output("git", "--git-dir", remote, "rev-parse", branch)
+    run("git", "--git-dir", remote, "merge-base", "--is-ancestor", first_publication, generated)
     run("bash", PUBLISH, missing, missing, "invalid", "none", env=pub_env)
     assert output("git", "--git-dir", remote, "rev-parse", branch) == generated
     site = work / "composed-site"
-    run("bash", COMPOSE, seed / "docs", remote, site, env=env)
+    run("bash", COMPOSE, seed / "docs", remote_uri, site, env=env)
     assert (site / "index.html").read_text() == "current website\n"
     assert (site / ".nojekyll").exists()
     assert not (site / ".git").exists()

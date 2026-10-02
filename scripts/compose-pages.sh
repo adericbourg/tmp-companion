@@ -11,7 +11,7 @@ trap 'rm -rf "$work"' EXIT
 git_auth() { git -c credential.helper='!gh auth git-credential' "$@"; }
 BRANCH=codex/linux-package-repos
 if git_auth ls-remote --exit-code --heads "$REMOTE" "$BRANCH" >/dev/null; then
-  git_auth clone --quiet --single-branch --branch "$BRANCH" "$REMOTE" "$work/repos"
+  git_auth clone --quiet --single-branch --depth 1 --branch "$BRANCH" "$REMOTE" "$work/repos"
   for format in apt rpm; do
     [ -d "$work/repos/$format" ] || continue
     rm -rf "${OUTPUT:?}/$format"

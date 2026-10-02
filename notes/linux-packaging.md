@@ -121,8 +121,8 @@ They are not committed to protected `main` or mixed into the website's source.
 
 **Publication.** The `publish-linux-repos` job in `release.yml` downloads whatever
 Linux builds succeeded. An API error, expired artifact or failed download of an
-existing artifact fails publication; an absent artifact is an allowed skip. No artifacts means no key import, signing, Git checkout or
-push. If only one format is available, its repository is replaced and the other
+existing artifact fails publication; an absent artifact is an allowed skip. With no artifacts, the source checkout runs but publication skips key import, signing,
+the generated-repository checkout and push. If only one format is available, its repository is replaced and the other
 format's published files remain unchanged. Both replacement builds are verified
 before the generated checkout is updated and pushed as one commit.
 

@@ -18,7 +18,7 @@ work="$(mktemp -d "${TMPDIR:-/tmp}/tmp-companion-publish.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
 git_auth() { git -c credential.helper='!gh auth git-credential' "$@"; }
 if git_auth ls-remote --exit-code --heads "$REMOTE" "$BRANCH" >/dev/null; then
-  git_auth clone --quiet --single-branch --branch "$BRANCH" "$REMOTE" "$work/repos"
+  git_auth clone --quiet --single-branch --depth 1 --branch "$BRANCH" "$REMOTE" "$work/repos"
 else
   code=$?
   [ "$code" -eq 2 ] || exit "$code"
